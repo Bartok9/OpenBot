@@ -244,7 +244,8 @@ function render(t: Theme): string {
   const bots: [number, number, string, string, boolean][] = [
     [372, 212, "agent-bot :4200", "proof-of-concept AG-UI Bot", false],
     [606, 212, "agent-langgraph :4201", "LangGraph AG-UI Bot", false],
-    [840, 250, "your agent", "any AG-UI endpoint, any framework", true],
+    [840, 212, "agent-dsh :4202", "DeepSeek Harness AG-UI Bot", false],
+    [1074, 250, "your agent", "any AG-UI endpoint, any framework", true],
   ];
   text(372, botY - 14, "BOTS", {
     size: 11.5,
@@ -462,7 +463,7 @@ function render(t: Theme): string {
   });
   label(svX + 390, svY - 36, "a tool call", t.muted);
   // the one you bring plugs in exactly the same way
-  arrow(940, botY + botH + 8, svX + svW - 40, svY - 8, {
+  arrow(1174, botY + botH + 8, svX + svW - 40, svY - 8, {
     colour: t.bring,
     dashed: true,
     width: 1.5,

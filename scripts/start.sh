@@ -30,6 +30,10 @@ SERVER_PORT="$(setting SERVER_PORT 3001)"
 COMPUTER_PORT="$(setting COMPUTER_PORT 4100)"
 BOT_PORT="$(setting BOT_PORT 4200)"
 LANGGRAPH_PORT="$(setting LANGGRAPH_PORT 4201)"
+DSH_PORT="$(setting DSH_PORT 4202)"
+# The DeepSeek Harness Bot is additive: it only starts when its key is configured, so a deployment
+# without one is not gated on a service that would refuse to boot.
+DEEPSEEK_API_KEY="$(setting DEEPSEEK_API_KEY "")"
 SUPERVISOR_PORT="$(setting SUPERVISOR_PORT 4500)"
 ONE_COMPUTER_EACH="${OPENBOT_ONE_COMPUTER_EACH:-true}"
 export APP_PORT SERVER_PORT
@@ -79,7 +83,13 @@ SERVICES=(postgres)
 if [ "$ONE_COMPUTER_EACH" = "true" ]; then
   SERVICES+=(supervisor)
 fi
-for svc_port in "agent-computer:$COMPUTER_PORT" "agent-bot:$BOT_PORT" "agent-langgraph:$LANGGRAPH_PORT"; do
+BOT_SERVICES=("agent-computer:$COMPUTER_PORT" "agent-bot:$BOT_PORT" "agent-langgraph:$LANGGRAPH_PORT")
+if [ -n "$DEEPSEEK_API_KEY" ]; then
+  BOT_SERVICES+=("agent-dsh:$DSH_PORT")
+else
+  info "  agent-dsh: skipped (DEEPSEEK_API_KEY is not set)"
+fi
+for svc_port in "${BOT_SERVICES[@]}"; do
   svc="${svc_port%%:*}"; port="${svc_port##*:}"
   if curl -fsS --max-time 3 "http://localhost:$port/health" >/dev/null 2>&1; then
     info "  $svc: already answering on $port"
@@ -89,7 +99,7 @@ for svc_port in "agent-computer:$COMPUTER_PORT" "agent-bot:$BOT_PORT" "agent-lan
 done
 
 export SUPERVISOR_TOKEN COMPUTER_TOKEN
-export COMPUTER_PORT BOT_PORT LANGGRAPH_PORT SUPERVISOR_PORT
+export COMPUTER_PORT BOT_PORT LANGGRAPH_PORT DSH_PORT SUPERVISOR_PORT
 docker compose up -d --build "${SERVICES[@]}" >/dev/null
 if ! docker compose run --rm --build migrate >"$LOGS/migrate.log" 2>&1; then
   red "  Migrations did not apply. The database is not the schema this server expects."
@@ -99,6 +109,9 @@ fi
 wait_for "http://localhost:$COMPUTER_PORT/health" "agent-computer"
 wait_for "http://localhost:$BOT_PORT/health" "agent-bot"
 wait_for "http://localhost:$LANGGRAPH_PORT/health" "agent-langgraph"
+if [ -n "$DEEPSEEK_API_KEY" ]; then
+  wait_for "http://localhost:$DSH_PORT/health" "agent-dsh"
+fi
 
 for table in agent_profiles agent_preferences; do
   if ! docker compose exec -T postgres \

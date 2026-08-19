@@ -195,6 +195,7 @@ Full reference: [docs/configuration.md](docs/configuration.md).
 | `agent-computer`         | 4100                       | Chromium plus `/workspace` and browser profile.                                                  |
 | `agent-bot`              | 4200                       | Proof-of-concept AG-UI Bot.                                                                          |
 | `agent-langgraph`        | 4201                       | LangGraph AG-UI Bot.                                                                             |
+| `agent-dsh`              | 4202                       | DeepSeek Harness AG-UI Bot with its own bash/file tools. Starts only with `DEEPSEEK_API_KEY`.    |
 | `supervisor`             | 4500 host / 4300 container | Creates and manages one computer per Bot.                                                        |
 | PostgreSQL with pgvector | 5432                       | Product data, policy, audit, credentials, grants, channels, knowledge, and component metadata.   |
 | CopilotKit Intelligence  | external                   | Durable threads and memory.                                                                      |

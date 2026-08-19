@@ -43,6 +43,26 @@ All four Intelligence values are required together. Missing any of them stops se
 | `BOT_MODEL`          | provider default from Bot code/env | Model used by the shipped Bots.                                     |
 | `BOT_RESPONSES_API`  | `false`                            | Makes `agent-langgraph` use the OpenAI Responses API.               |
 
+## The DeepSeek Harness Bot
+
+`agent-dsh` runs [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) behind the
+same AG-UI contract as the other Bots. It executes its own tools (bash, files, subagents) inside
+its container rather than calling the surface's computer tools; [agent-dsh/README.md](../agent-dsh/README.md)
+describes that trust model. It refuses to start without its key, and `scripts/start.sh` includes it
+only when the key is set.
+
+| Variable               | Default                    | Meaning                                                                    |
+| ---------------------- | -------------------------- | --------------------------------------------------------------------------- |
+| `DEEPSEEK_API_KEY`     | unset                      | DeepSeek credential; required by `agent-dsh`.                              |
+| `DEEPSEEK_BASE_URL`    | DeepSeek's public API      | Alternative chat-completions endpoint.                                     |
+| `DSH_MODEL`            | `deepseek-v4-flash`        | Model for every conversation this Bot runs.                                |
+| `DSH_REASONING_EFFORT` | `high`                     | Thinking effort: `off`, `low`, `high`, or `max`.                           |
+| `DSH_SYSTEM_PROMPT`    | built-in persona           | Deployment-wide base persona; coworker standing roles still apply per chat. |
+| `DSH_MAX_TOKENS`       | adapter default            | Output-token cap per model request, inherited by subagents.                |
+| `DSH_AUTH_TOKEN`       | unset                      | When set, `/ag-ui` requires `Authorization: Bearer <token>`.               |
+| `DSH_WORKSPACE`        | `/workspace` in Docker     | Where its bash and file tools act.                                         |
+| `DSH_SESSION_ROOT`     | `/data/sessions` in Docker | Where the harness writes its own JSONL session log.                        |
+
 ## Authentication
 
 | Variable                     | Meaning                                                                                |
@@ -119,6 +139,7 @@ When optional SPIRE services are used:
 | `agent-computer`  | 4100                       | `COMPUTER_PORT`   |
 | `agent-bot`       | 4200                       | `BOT_PORT`        |
 | `agent-langgraph` | 4201                       | `LANGGRAPH_PORT`  |
+| `agent-dsh`       | 4202                       | `DSH_PORT`        |
 | `supervisor`      | 4500 host / 4300 container | `SUPERVISOR_PORT` |
 | PostgreSQL        | 5432                       | `POSTGRES_PORT`   |
 

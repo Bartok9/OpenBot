@@ -1,0 +1,100 @@
+# The DeepSeek Harness runtime this Bot drives, composed the way dsh composes everything: as a list
+# of plugins. The adapter in src/index.ts spawns `dsh-jsonrpc-agent` with this file; every capability
+# the agent has (model, tools, persistence) is a row here, and a deployment can change the agent by
+# changing the row rather than the adapter.
+#
+# Derived from deepseek-harness's examples/jsonrpc-agent/cordis.yml, the composition its SDK ships
+# and tests against. stdout belongs to the SDK's JSON-RPC framing: no console logger, no terminal UI.
+
+- id: sdk-jsonrpc-server
+  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
+
+# The DeepSeek model adapter. The model itself arrives per session over JSON-RPC (the adapter
+# process passes DSH_MODEL), so it is not pinned here. The credential is read from
+# DEEPSEEK_API_KEY, and DEEPSEEK_BASE_URL may point at a private endpoint.
+- id: llm-deepseek
+  name: '@deepseek-ai/dsh-llm-deepseek'
+  config:
+    thinking: enabled
+    # `||` rather than `??` on purpose, here and below: an empty string means "unset".
+    reasoningEffort: !!js process.env.DSH_REASONING_EFFORT || 'high'
+
+# Child-process plumbing for the bash tool.
+- id: subprocess
+  name: '@deepseek-ai/dsh-subprocess-local'
+
+- id: bash
+  name: '@deepseek-ai/dsh-bash-local'
+  config:
+    cwd: !!js process.env.DSH_CWD || process.cwd()
+    timeoutMs: 60000
+
+# The agent loop, prompt assembly and core tool set. The persona is the deployment-wide base;
+# each coworker's standing role arrives per conversation from OpenBot, delivered by the adapter.
+- id: agent-spine
+  name: '@deepseek-ai/dsh-agent-spine-demo'
+  config:
+    persona: !!js process.env.DSH_SYSTEM_PROMPT || 'You are a coding agent.'
+    workspaceContext: false
+    skills:
+      enabled: false
+    toolBash:
+      enableRunInBackground: false
+    toolJobs: false
+
+# dsh's own durable session log, one JSONL file per conversation under DSH_SESSION_ROOT.
+# Uncompressed on purpose: the log is this Bot's equivalent of an audit trail, and a plain file can
+# be read without tooling. Set DSH_SESSION_COMPRESSION=zstd to trade that for smaller files.
+- id: sessions
+  name: '@deepseek-ai/dsh-session-persistence-jsonl'
+  config:
+    root: !!js process.env.DSH_SESSION_ROOT || './.dsh/sessions'
+    compression: !!js process.env.DSH_SESSION_COMPRESSION || 'none'
+
+- id: session-checkpoints
+  name: '@deepseek-ai/dsh-session-checkpoint-policy'
+
+# Subagents: the model can delegate a bounded task to a child agent in the same process.
+- id: subagent
+  name: '@deepseek-ai/dsh-subagent'
+
+- id: subagent-spawn-in-process
+  name: '@deepseek-ai/dsh-subagent-spawn-in-process'
+  config:
+    providerName: spawn
+
+- id: tool-subagent
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: subagent
+    enableRunInBackground: false
+
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
+
+# Filesystem tools, scoped to the same workspace as bash.
+- id: fs-local
+  name: '@deepseek-ai/dsh-fs-local'
+  config:
+    cwd: !!js process.env.DSH_CWD || process.cwd()
+
+- id: fs-observation-policy
+  name: '@deepseek-ai/dsh-fs-observation-policy'
+
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: token-meter
+  name: '@deepseek-ai/dsh-token-meter'
+
+# Automatic context compaction, so long channels do not run the model out of context.
+- id: compaction-basic
+  name: '@deepseek-ai/dsh-compaction-basic'
+  config:
+    thresholdRatio: 0.8
+    retainRatio: 0.16
+    maxTokens: 8192
+    compactionRetries: 1

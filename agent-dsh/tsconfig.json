@@ -1,0 +1,12 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    // The Docker image runs this package's TypeScript directly on Node's type stripping, which
+    // only erases; these two options keep the code inside what that runtime accepts.
+    "erasableSyntaxOnly": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "types": ["node", "bun"]
+  },
+  "include": ["src"]
+}

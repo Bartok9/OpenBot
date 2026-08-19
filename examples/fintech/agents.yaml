@@ -25,3 +25,14 @@ agents:
     avatar_seed: risk-analyst
     type: remote-ag-ui
     endpoint: ${MANAGED_AGENT_AG_UI_URL:-http://localhost:4200/ag-ui}
+  # The DeepSeek Harness Bot (agent-dsh), a coworker that executes bash and file tools in its own
+  # container instead of using the shared browser. Commented out because every Bot in this file must
+  # be reachable the moment the deployment starts, and agent-dsh only runs when DEEPSEEK_API_KEY is
+  # set. Uncomment after enabling it; see agent-dsh/README.md.
+  # - id: harness-engineer
+  #   name: Harness Engineer
+  #   title: Software Engineering
+  #   role_description: Investigate, script, and build things in your own workspace.
+  #   avatar_seed: harness-engineer
+  #   type: remote-ag-ui
+  #   endpoint: http://localhost:4202/ag-ui

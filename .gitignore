@@ -17,3 +17,6 @@ app/src/lib/generated/application-config.ts
 
 # TanStack Router scratch output
 app/.tanstack/
+
+# agent-dsh local workspace and harness session log (volumes in Docker)
+agent-dsh/.dsh/
