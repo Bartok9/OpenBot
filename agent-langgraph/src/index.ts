@@ -235,12 +235,19 @@ const TOOL_URL =
 const TOOL_TOKEN = process.env.AGENT_TOOL_TOKEN ?? "";
 
 async function callTool(
-  botId: string,
+  run: string,
   name: string,
   args: Record<string, unknown>,
 ): Promise<string> {
   if (!TOOL_TOKEN) {
     return "Refused. This Bot has no credential for calling tools back through its deployment.";
+  }
+  if (!run) {
+    /*
+     * No statement from the deployment about whose run this is, so there is nothing to act on behalf
+     * of. Reported as a result rather than thrown: the run continues and says what it could not do.
+     */
+    return "Refused. This run carried no signed statement of which Bot and person it is for.";
   }
   try {
     const response = await fetch(TOOL_URL, {
@@ -249,7 +256,14 @@ async function callTool(
         "content-type": "application/json",
         "x-openbot-agent-token": TOOL_TOKEN,
       },
-      body: JSON.stringify({ botId, name, args }),
+      /*
+       * The deployment's own statement, handed straight back.
+       *
+       * The Bot and the actor used to be sent from here, which meant this process asserted who it was
+       * acting for. It is not in a position to know, and anything holding the token could claim
+       * anything, so the deployment says it and this only carries the note.
+       */
+      body: JSON.stringify({ name, args, run }),
     });
     const body = (await response.json()) as { text?: string };
     return body.text ?? "The tool returned nothing.";
@@ -261,10 +275,43 @@ async function callTool(
   }
 }
 
-/** Which Bot is running, so the deployment can attribute the call it is about to be asked for. */
-function botIdOf(input: RunAgentInput): string {
-  const props = input.forwardedProps as { openbotBotId?: unknown } | undefined;
-  return typeof props?.openbotBotId === "string" ? props.openbotBotId : "";
+/**
+ * The deployment's signed statement of what this run is.
+ *
+ * Opaque here on purpose: this process cannot read it and has no reason to. It carries it back when it
+ * calls a tool, and the deployment that signed it is the only thing that can open it.
+ */
+function runAssertionOf(input: RunAgentInput): string {
+  const props = input.forwardedProps as { openbotRun?: unknown } | undefined;
+  return typeof props?.openbotRun === "string" ? props.openbotRun : "";
+}
+
+/**
+ * The tools this deployment runs, as opposed to the ones the surface draws.
+ *
+ * Both arrive in the same list and no naming rule separates them, so the deployment names its own.
+ * Absent, nothing is treated as the deployment's: a Bot that guessed wrong would either apologise for
+ * a component it did show, or quietly report a governed tool as drawn without ever calling it. The
+ * first is embarrassing and the second is a lie about governance, so an unmarked run does neither.
+ */
+function deploymentToolsOf(input: RunAgentInput): Set<string> {
+  const props = input.forwardedProps as
+    | { openbotDeploymentTools?: unknown }
+    | undefined;
+  const names = props?.openbotDeploymentTools;
+  return new Set(
+    Array.isArray(names)
+      ? names.filter((name) => typeof name === "string")
+      : [],
+  );
+}
+
+/** Did the model reach for something the surface owns rather than something this deployment runs? */
+function callsTheSurface(
+  calls: { name: string }[],
+  ours: Set<string>,
+): boolean {
+  return calls.some((call) => !ours.has(call.name));
 }
 
 /**
@@ -279,10 +326,11 @@ function botIdOf(input: RunAgentInput): string {
  */
 function buildGraph(input: RunAgentInput) {
   const model = buildModel();
-  const botId = botIdOf(input);
+  const run = runAssertionOf(input);
 
   const tools = toBoundTools(input);
   const bound = tools.length > 0 ? model.bindTools(tools) : model;
+  const ours = deploymentToolsOf(input);
 
   return new StateGraph(MessagesAnnotation)
     .addNode("answer", async (state) => ({
@@ -291,25 +339,48 @@ function buildGraph(input: RunAgentInput) {
     .addNode("tools", async (state) => {
       const last = state.messages.at(-1) as AIMessage;
       const results = await Promise.all(
-        (last.tool_calls ?? []).map(async (call) => {
-          const text = await callTool(
-            botId,
-            call.name,
-            (call.args ?? {}) as Record<string, unknown>,
-          );
-          return new ToolMessage({
-            content: text,
-            tool_call_id: call.id ?? call.name,
-            name: call.name,
-          });
-        }),
+        /*
+         * Only this deployment's own tools. A component is drawn by the surface, and a decision is
+         * answered there by a person, so neither is executed here and neither gets a result invented
+         * here. The run ends instead, and the surface starts the next one carrying what it produced.
+         */
+        (last.tool_calls ?? [])
+          .filter((call) => ours.has(call.name))
+          .map(async (call) => {
+            const text = await callTool(
+              run,
+              call.name,
+              (call.args ?? {}) as Record<string, unknown>,
+            );
+            return new ToolMessage({
+              content: text,
+              tool_call_id: call.id ?? call.name,
+              name: call.name,
+            });
+          }),
       );
       return { messages: results };
     })
     .addEdge(START, "answer")
     .addConditionalEdges("answer", (state) => {
       const last = state.messages.at(-1) as AIMessage | undefined;
-      return (last?.tool_calls?.length ?? 0) > 0 ? "tools" : END;
+      const calls = last?.tool_calls ?? [];
+      if (calls.length === 0) return END;
+      /*
+       * A call the surface owns ends the run.
+       *
+       * This is how a tool that lives in the browser is supposed to work: the Bot asks for it, the
+       * run finishes, the surface draws it or puts the question to a person, and the surface begins
+       * the next run with the answer in hand. Running the loop through it here instead invents a
+       * result: the Bot apologises for a chart the person is looking at, and an approval card that
+       * has already been answered on its behalf sits waiting for a click that can never land.
+       *
+       * A turn that asks for both kinds at once ends too, and the model asks again for what it still
+       * has no answer to. That is the rarer case and the safe way round: the alternative runs a
+       * governed tool whose result nobody is waiting for.
+       */
+      if (callsTheSurface(calls, ours)) return END;
+      return "tools";
     })
     .addEdge("tools", "answer")
     .compile();
