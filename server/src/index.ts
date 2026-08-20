@@ -17,6 +17,7 @@ import { createThreadIdentity } from "./channels/thread-identity";
 import { websocket as channelSocket } from "./channels/socket";
 import { createSandboxedStore } from "./components/sandboxed";
 import { createComponentStore } from "./components/store";
+import { createApprovalRegistry } from "./computer/approvals";
 import { createComputerClient } from "./computer/client";
 import { createComputerGateway } from "./computer/gateway";
 import {
@@ -197,12 +198,23 @@ const bootAuditStore = createAuditStore(database);
  */
 const sandboxedStore = createSandboxedStore(database, bootAuditStore);
 
+/**
+ * The one place a Bot's unanswered questions live.
+ *
+ * Built here rather than inside either thing that raises them, because a deployment has one of
+ * these and two things that ask: a Bot meeting an `ask` rule on a button and the same Bot meeting
+ * one on a tool call are the same interruption to the same person, and a registry per subsystem
+ * would mean the surface somebody happens to be looking at decides which of them they can answer.
+ */
+const approvals = createApprovalRegistry();
+
 const pluginStore = createPluginStore({
   database,
   auditStore: bootAuditStore,
   credentials: credentialStore,
   encryptionKey: config.keyEncryptionKey,
   policy: () => policyStore.get(),
+  approvals,
 });
 
 void recordAuditEvent(bootAuditStore, {
@@ -344,6 +356,7 @@ const app = createApp(
         // Read on every decision rather than captured once, so a rule an administrator adds while the
         // server is running applies to the very next action instead of after a restart.
         policy: () => policyStore.get(),
+        approvals,
         // Stop, reset and the listing act on containers when there are containers to act on.
         ...(supervisor ? { supervisor } : {}),
         // Only when a deployment has said its Bots retry on a slower rhythm than the built-in window
@@ -373,6 +386,8 @@ const app = createApp(
   sandboxedStore,
   // How a thread that has no channel is named, so the direct Bot chat is in the same namespace.
   threadIdentity,
+  // Where a person answers what the boundary stopped to ask, whichever half of the product asked.
+  approvals,
 );
 
 /**
