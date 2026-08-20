@@ -3,7 +3,8 @@
 An adapter between OpenBot's AG-UI contract and [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 (`dsh`), DeepSeek's open-source agent harness. It makes a dsh agent registrable as a Bot the same
 way as any other AG-UI endpoint: from `/agents`, from the tenant package, or via
-`MANAGED_AGENT_AG_UI_URL`.
+`MANAGED_AGENT_AG_UI_URL`. The endpoint is plain AG-UI, so other consumers work too — including
+CopilotKit's Channels SDK ([below](#using-it-from-the-channels-sdk)).
 
 ## What kind of Bot this is
 
@@ -88,6 +89,32 @@ started with `node`, which must be Node `^22.19 || >=24` (dsh's requirement). Po
 | `DSH_SESSION_ROOT`     | `/data/sessions` (Docker)     | Where the harness writes its session log.                          |
 | `DSH_NODE_BIN`         | `node`                        | Node executable used to spawn the runtime.                         |
 | `PORT`                 | `4202`                        | The adapter's own port.                                            |
+
+## Using it from the Channels SDK
+
+Nothing in this service is OpenBot-specific: it is dsh behind a plain AG-UI endpoint, and OpenBot
+is just one consumer. CopilotKit's [Channels SDK](https://docs.copilotkit.ai/channels) — which
+brings an AG-UI agent into Slack and Microsoft Teams — consumes agents exactly the same way
+OpenBot does: an `HttpAgent` pointed at an endpoint URL, one instance per platform thread (see
+[OpenTag](https://github.com/CopilotKit/OpenTag), its starter application). So the same running
+`agent-dsh` can serve both surfaces at once:
+
+- Point the Channel's agent at this service — in OpenTag's terms, `AGENT_URL=http://<host>:4202/ag-ui`.
+- Auth maps one to one: set `DSH_AUTH_TOKEN` here and give the Channel
+  `Authorization: Bearer <token>` as its agent header (OpenTag's `AGENT_AUTH_HEADER`).
+- Reach matters: `docker-compose.yml` binds this port to loopback. A channel runner on another
+  host needs the port published on a private network, with the bearer token set — this service
+  runs shell commands for whoever can reach it.
+- Threads stay separate on purpose. Each Slack or Teams thread arrives with its own AG-UI
+  `threadId` and becomes its own dsh session, independent of any OpenBot channel with the same
+  coworker. There is no shared memory across surfaces.
+
+One fit note: Channels SDK channels can register channel-side tools, generative UI components,
+and human-in-the-loop approval gates, all of which ride `input.tools` and run interrupts. Those
+never reach dsh, for the reason in [Known limitations](#known-limitations) — so a dsh-backed
+Channel is a self-contained worker that narrates its own tool activity into the thread, not a
+driver of platform-native UI. If dsh grows caller-executed tool support over its SDK wire, both
+surfaces pick it up here at once.
 
 ## Tests
 
