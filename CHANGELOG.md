@@ -180,6 +180,16 @@ Sessions survive and nobody signs in again.
   access and refresh tokens use Better Auth's own encryption, keyed on `BETTER_AUTH_SECRET`.
 - **A failed provider registration looked like a button that did not work.** The error was rendered
   on the page behind the dialog, which was covering it.
+- **Deleting a component in the playground could release one the build ships.** `DELETE
+  /api/sandboxed/:name` deleted from the shared components table by name, without checking
+  which kind of component the name belonged to. Naming a compiled component removed its
+  governance row, and the foreign keys took that component's per-Bot withholdings and its
+  function grants with it. Withholding is the half that fails open: a published component is
+  available to every Bot unless a row says otherwise, so the next catalogue announcement brought
+  the component back published, and available to a Bot it had deliberately been kept from. The
+  audit row called it `kind: "sandboxed"`. The endpoint now refuses a name this surface does not
+  own and answers 404, the way publishing already did. A governance row whose source is already
+  gone is still this surface's to clear.
 - **A write could follow a symlink out of the Bot's workspace.** The confinement resolved the
   directory a write would land in but not the name it would land on, so a link left at `notes.txt`
   pointing outside was followed by the write; a read through the identical link was already refused.
