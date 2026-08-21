@@ -8,6 +8,15 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
+### Upgrading
+
+Two configurations now refuse to start:
+
+- A provider configured with no `INITIAL_ADMIN_EMAILS`. Set it to at least one address.
+- No provider at all with `NODE_ENV=production`. Configure one, or set `OPENBOT_SINGLE_USER=true`.
+
+Sessions survive and nobody signs in again.
+
 ### Added
 
 - **Releases are cut by a workflow, not by hand.** `Create release PR` bumps the version and promotes
@@ -22,6 +31,24 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
   supervised service is respawning. A single `verify` check covers every job, so branch protection
   needs one entry. The same checks run again against the release commit when a release is published,
   so they gate the release rather than the proposal for one.
+- **Sign in with Google, Microsoft or Okta.** Any one of them turns sign-in on; configure several
+  and the sign-in screen offers each, on matching buttons carrying each provider's own mark.
+  `INITIAL_ADMIN_EMAILS` says who is an administrator. It is required whenever a provider is
+  configured, because nothing else grants the role, and it is now a floor rather than a one-off:
+  an address it names is made an administrator at every sign-in, so adding somebody to the list
+  works even after they have already signed in.
+- **SAML and OpenID Connect, registered while running.** `/admin/identity-providers` takes the
+  metadata a company's identity team supplies and registers their own IdP. Somebody then types their
+  email address on the sign-in screen and the domain decides which provider they are sent to, so a
+  company mid-merger can run two. Registering, changing or removing one is administrator-only, which
+  the upstream plugin does not require: it guards those routes with a session, and anybody who could
+  reach them could register a provider for a domain and mint themselves colleagues.
+- **A People screen.** `/admin/people` lists everybody who has signed in, with the provider they came
+  through and when they were last here, and lets an administrator promote, demote, or remove
+  somebody. Removing ends the session they are using and stops the next sign-in, keyed on the
+  address so signing in again through the provider does not quietly create a new account. Every
+  change is on the audit trail. Somebody named in `INITIAL_ADMIN_EMAILS` cannot be demoted or
+  removed here, and nobody can do either to themselves.
 - **One container that runs the whole thing.** The root `Dockerfile` builds an image carrying the
   app, the API, a Bot computer, and optionally PostgreSQL, supervised together. Point `DATABASE_URL`
   at a database you already run and the built-in one never starts; leave it unset and the container
@@ -92,6 +119,14 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ### Changed
 
+- **A deployment with no identity provider is one administrator, without a flag.** That is how a
+  fresh clone reaches the product. Where `NODE_ENV=production`, an unconfigured deployment now
+  refuses to start instead, because a public URL where every visitor is an administrator is silent
+  and looks like it works. `OPENBOT_SINGLE_USER=true` replaces `OPENBOT_DEV_NO_AUTH`, which is still
+  honoured, and is how somebody says they meant an open deployment.
+- **Requires Better Auth 1.7**, which adds an `issuer` to every account. Migrations `0002` to `0004`
+  add the column, backfill existing rows with their provider's real issuer, and then make it
+  required, so nobody is asked to sign in again.
 - **Where a Bot's computer runs is now a plug.** One `ComputerProvider` interface sits under the
   gateway, with the Docker supervisor as one implementation and a shared computer as another. A
   computer somewhere else is an adapter rather than a change to the governed path. Thanks to

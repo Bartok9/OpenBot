@@ -1,6 +1,7 @@
 import { serve } from "bun";
-import { createAgentProfileStore } from "./agents/profile-store";
+import { sql } from "drizzle-orm";
 import { mintRunAssertion } from "./agents/callback-token";
+import { createAgentProfileStore } from "./agents/profile-store";
 import { createRuntimeAgentLoader } from "./agents/runtime-agents";
 import { createApp } from "./app";
 import { createAuditReader, createAuditStore, recordAuditEvent } from "./audit";
@@ -13,9 +14,9 @@ import {
   startChannelActivityListener,
 } from "./channels/events";
 import { createChannelStore } from "./channels/routes";
+import { websocket as channelSocket } from "./channels/socket";
 import { createStallGuard } from "./channels/stall-guard";
 import { createThreadIdentity } from "./channels/thread-identity";
-import { websocket as channelSocket } from "./channels/socket";
 import { createSandboxedStore } from "./components/sandboxed";
 import { createComponentStore } from "./components/store";
 import { createComputerGateway } from "./computer/gateway";
@@ -40,6 +41,8 @@ import {
   resolveModelApiKey,
 } from "./credentials";
 import { createDatabase } from "./db/client";
+import { ssoProviders } from "./db/schema";
+import { createPeopleStore } from "./people/store";
 import { createPluginStore } from "./plugins/store";
 import { grantedTools } from "./plugins/tools";
 import {
@@ -60,7 +63,7 @@ async function resolveRequestActor(request: Request): Promise<{
   name: string;
   role: OpenBotRole;
 }> {
-  if (config.devNoAuth) {
+  if (config.singleUser) {
     return { id: DEV_ACTOR.id, name: DEV_ACTOR.email, role: DEV_ACTOR.role };
   }
   const session = await auth?.api.getSession({ headers: request.headers });
@@ -109,7 +112,7 @@ const identifyActor: IdentifyActor = async (request) => {
 const config = loadConfig();
 const port = Number.parseInt(process.env.PORT ?? "3001", 10);
 const database = createDatabase(config.databaseUrl);
-await initializeDevActorUser(database, config.devNoAuth);
+await initializeDevActorUser(database, config.singleUser);
 // The vault, built before the agent store because a customer's agent may sit behind a key and that
 // key belongs here rather than on the agent row. See agents/auth-header.ts.
 const credentialStore = createCredentialStore(database);
@@ -156,7 +159,18 @@ const loadAgentsForActor = createRuntimeAgentLoader(database, agentVault, {
   token: config.managedAgentToken,
 });
 await synchronizeTenantPackage(database, tenantPackage);
-const auth = config.auth ? createAuth(config, database) : undefined;
+/*
+ * Built before `auth`, because the deny list is consulted during sign-in and the store is what
+ * holds it. It needs the administrator list too, so it can tell the screen which people the
+ * deployment's configuration has already decided about.
+ */
+const peopleStore = createPeopleStore(
+  database,
+  config.auth?.initialAdminEmails ?? [],
+);
+const auth = config.auth
+  ? createAuth(config, database, (email) => peopleStore.isRevoked(email))
+  : undefined;
 const computerProvider = config.computer
   ? createComputerProvider(config.computer)
   : undefined;
@@ -367,6 +381,15 @@ const app = createApp(
   sandboxedStore,
   // How a thread that has no channel is named, so the direct Bot chat is in the same namespace.
   threadIdentity,
+  // Who has signed in, and what an administrator may do about them.
+  peopleStore,
+  // Whether the sign-in screen should offer the email box that routes by domain.
+  async () => {
+    const [row] = await database
+      .select({ count: sql<number>`count(*)::int` })
+      .from(ssoProviders);
+    return row?.count ?? 0;
+  },
 );
 
 /**
@@ -506,11 +529,12 @@ serve<SocketData>({
   },
 });
 
-if (config.devNoAuth) {
+if (config.singleUser) {
   // Loud, every boot. A server that is not checking who is asking should never be a quiet default.
   console.warn(
-    "OPENBOT_DEV_NO_AUTH is on: every request is treated as " +
-      `${DEV_ACTOR.email} (administrator). Local development only.`,
+    "No identity provider is configured, so every request is treated as " +
+      `${DEV_ACTOR.email} (administrator). Configure GOOGLE_OAUTH_*, ` +
+      "MICROSOFT_OAUTH_* or OKTA_OAUTH_* before anybody else can reach this.",
   );
 }
 
