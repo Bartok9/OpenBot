@@ -1,10 +1,10 @@
 import { serve } from "bun";
-import { sql } from "drizzle-orm";
 import { mintRunAssertion } from "./agents/callback-token";
 import { createAgentProfileStore } from "./agents/profile-store";
 import { createRuntimeAgentLoader } from "./agents/runtime-agents";
 import { createApp } from "./app";
 import { createAuditReader, createAuditStore, recordAuditEvent } from "./audit";
+import { startAuditRetention } from "./audit-retention";
 import { createAuth } from "./auth";
 import { DEV_ACTOR, initializeDevActorUser } from "./auth/dev-actor";
 import { createRoleRepository } from "./auth/guards";
@@ -21,6 +21,7 @@ import { createThreadIdentity } from "./channels/thread-identity";
 import { createSandboxedStore } from "./components/sandboxed";
 import { createComponentStore } from "./components/store";
 import { createComputerGateway } from "./computer/gateway";
+import { startPolicyListener } from "./computer/policy-listener";
 import {
   createPolicyStore,
   DEFAULT_ACTION_POLICY,
@@ -199,6 +200,17 @@ const policyStore = createPolicyStore(
 // A boundary an administrator set is read back before the first action is decided, so a restart no
 // longer silently returns to the configured default.
 const policySource = await policyStore.load();
+/*
+ * And kept current afterwards.
+ *
+ * A boundary an administrator changes arrives at one server. Without this, every other server keeps
+ * enforcing what it read at boot, so a new deny rule stops roughly one action in N while the screen
+ * and the audit row both report success. See policy-listener.ts.
+ */
+const policyListener = await startPolicyListener(
+  config.databaseUrl,
+  policyStore,
+);
 
 /*
  * Record which boundary this process started with.
@@ -210,6 +222,16 @@ const policySource = await policyStore.load();
  * unavailable, and the row is a note for a reader rather than something the server depends on.
  */
 const bootAuditStore = createAuditStore(database);
+/*
+ * Old audit rows removed on a schedule, when a deployment has asked for that.
+ *
+ * One server sweeps rather than all of them, decided by an advisory lock. Off unless
+ * `AUDIT_RETENTION_DAYS` is set. See audit-retention.ts.
+ */
+const auditRetention = startAuditRetention(
+  config.databaseUrl,
+  config.auditRetentionDays,
+);
 const computerGateway = computerProvider
   ? createComputerGateway({
       provider: computerProvider,
@@ -559,11 +581,15 @@ if (config.singleUser) {
   );
 }
 
-// The activity listener holds a connection of its own for the life of the process. Released on the
-// way out, so a watch-mode restart does not leave one behind on every reload.
+// Each listener holds a connection of its own for the life of the process. Released on the way out,
+// so a watch-mode restart does not leave two behind on every reload.
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
-    void channelActivityListener.stop().finally(() => process.exit(0));
+    void Promise.allSettled([
+      channelActivityListener.stop(),
+      policyListener.stop(),
+      Promise.resolve(auditRetention.stop()),
+    ]).finally(() => process.exit(0));
   });
 }
 
