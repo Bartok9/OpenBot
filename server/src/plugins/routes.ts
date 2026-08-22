@@ -3,7 +3,17 @@ import { Hono } from "hono";
 import type { BotAccessCheck } from "../agents/profile-policy";
 import type { AppVariables } from "../auth/guards";
 import { requireAdmin } from "../auth/guards";
-import { CATALOGUE } from "./catalogue";
+import { CATALOGUE, catalogueEntry } from "./catalogue";
+import {
+  authorizationUrlFor,
+  challengeFor,
+  createVerifier,
+  readConnectState,
+  redeemAuthorizationCode,
+  redirectUriFor,
+  connectedAccountsUrlFor,
+  signConnectState,
+} from "./oauth";
 import {
   CatalogueEntryUnknownError,
   CustomServerRefusedError,
@@ -36,6 +46,30 @@ export function createPluginRoutes(
    * cannot end up calling somebody else's tools by leaving an argument off.
    */
   canUseBot: BotAccessCheck,
+  /**
+   * What the connect flow needs that the store does not hold: the key its state is signed with, and
+   * the address a vendor sends people back to.
+   *
+   * Optional, so a deployment with no public URL configured simply cannot start a connect flow and
+   * says so, rather than building a redirect URI out of a request header and failing at the vendor.
+   *
+   * Last, and after every required parameter, because that is the only position an optional argument
+   * can hold. Both of these arrived on separate branches as "one more parameter", which is how a
+   * positional list becomes a trap: every argument from here on is optional, so a misplaced one
+   * typechecks and simply does nothing.
+   */
+  connect?: {
+    encryptionKey: string;
+    publicUrl: string | undefined;
+    /**
+     * Where the app is, which is not where this API is.
+     *
+     * The callback lands here and has to send the person back to a page. A relative redirect would
+     * put them on this server's origin, which locally is a Vite-less port that serves no pages at
+     * all — so the flow would complete correctly and end on a 404.
+     */
+    appUrl: string | undefined;
+  },
 ) {
   const routes = new Hono<{ Variables: AppVariables }>();
 
@@ -76,12 +110,30 @@ export function createPluginRoutes(
         vendor: entry.vendor,
         summary: entry.summary,
         docsUrl: entry.docsUrl,
-        needsCredential: entry.needsCredential,
+        /*
+         * The kind, not the whole thing. The page needs to know what to ask an administrator for;
+         * it has no use for the vendor's OAuth addresses, and a URL this deployment sends an
+         * authorization code to is not improved by also existing in every browser that opens the
+         * Plugins page.
+         */
+        auth: entry.auth.kind,
         perInstance: entry.host === null,
       })),
       servers: await store.listServers(),
       // Scoped: the deployment's skills plus this person's own. An administrator sees them all.
       skills: await store.listSkills(skillActor(context)),
+      /*
+       * What an administrator has to register with the vendor, character for character.
+       *
+       * Served rather than assembled in the browser, so what is displayed is exactly what the
+       * callback will present. A mismatch here fails at the vendor with a message that does not name
+       * us, which is a bad afternoon for whoever is setting it up.
+       *
+       * Null means this deployment has no public URL, so it cannot complete a consent flow at all.
+       */
+      redirectUri: connect?.publicUrl
+        ? redirectUriFor(connect.publicUrl)
+        : null,
     }),
   );
 
@@ -159,6 +211,50 @@ export function createPluginRoutes(
     }
   });
 
+  /**
+   * Register this deployment's OAuth client for a server reached as the person asking.
+   *
+   * Its own endpoint rather than a field on `POST /servers`, because it is a separate act with a
+   * separate lifetime: a client is rotated without the server being re-added, and re-adding a server
+   * should not require re-typing a client. An administrator's, like everything else that decides what
+   * a Bot can reach.
+   */
+  routes.post("/servers/:id/oauth-client", requireUser, async (context) => {
+    const forbidden = requireAdmin(context);
+    if (forbidden) return forbidden;
+
+    const body = (await context.req.json().catch(() => null)) as {
+      clientId?: string;
+      clientSecret?: string;
+    } | null;
+    if (!body?.clientId?.trim() || !body.clientSecret?.trim()) {
+      return context.json(
+        { error: "A client id and a client secret are both required." },
+        400,
+      );
+    }
+
+    try {
+      await store.registerOAuthClient({
+        serverId: context.req.param("id"),
+        client: {
+          clientId: body.clientId.trim(),
+          clientSecret: body.clientSecret.trim(),
+        },
+        by: actorEmail(context),
+      });
+      return context.json({ ok: true });
+    } catch (error) {
+      if (
+        error instanceof CatalogueEntryUnknownError ||
+        error instanceof CustomServerRefusedError
+      ) {
+        return context.json({ error: error.message }, 400);
+      }
+      throw error;
+    }
+  });
+
   routes.delete("/servers/:id", requireUser, async (context) => {
     const forbidden = requireAdmin(context);
     if (forbidden) return forbidden;
@@ -173,7 +269,10 @@ export function createPluginRoutes(
     if (forbidden) return forbidden;
 
     try {
-      const result = await store.refreshTools(context.req.param("id"));
+      const result = await store.refreshTools(
+        context.req.param("id"),
+        context.var.actor.id,
+      );
       const servers = await store.listServers();
       return context.json({
         tools: result.tools,
@@ -185,6 +284,143 @@ export function createPluginRoutes(
       }
       throw error;
     }
+  });
+
+  /**
+   * Where a person's own connections are, and how to start a new one.
+   *
+   * Not admin-only, and that is the point: an administrator registers the connector once, and then
+   * everybody connects their own account. Somebody can only ever see or start their own.
+   */
+  routes.get("/connections", requireUser, async (context) => {
+    const connections = await store.connectionsFor(context.var.actor.id);
+    return context.json({
+      connections,
+      // Shown to an administrator so they can register the client at the vendor with the exact value
+      // this deployment will send. Null means the deployment has no public URL and cannot connect.
+      redirectUri: connect?.publicUrl
+        ? redirectUriFor(connect.publicUrl)
+        : null,
+    });
+  });
+
+  /**
+   * Begin connecting one person's own account.
+   *
+   * Answers with a URL rather than redirecting, so the browser decides when to leave the page. The
+   * state is minted here, from the session, and the person's identity never comes off the callback.
+   */
+  routes.post("/servers/:id/connect", requireUser, async (context) => {
+    const serverId = context.req.param("id");
+    if (!connect?.publicUrl) {
+      return context.json(
+        {
+          error:
+            "This deployment has no public URL configured, so it cannot complete a consent flow. Set OPENBOT_PUBLIC_URL.",
+        },
+        503,
+      );
+    }
+
+    const entry = catalogueEntry(serverId);
+    if (entry?.auth.kind !== "user-oauth") {
+      return context.json(
+        { error: `${serverId} is not connected as an individual person.` },
+        400,
+      );
+    }
+
+    const client = await store.oauthClientFor(serverId);
+    if (!client) {
+      return context.json(
+        {
+          error: `${entry.title} has no OAuth client registered yet. An administrator has to add one first.`,
+        },
+        409,
+      );
+    }
+
+    /*
+     * Where to come back to, as one of two names rather than a URL the caller chose.
+     *
+     * Read from the query and narrowed immediately, so an unrecognised value is the default rather
+     * than something carried into a signed state. See {@link ConnectOrigin}: a destination that could
+     * name another origin is an open redirect with a consent screen in front of it.
+     */
+    const returnTo =
+      context.req.query("returnTo") === "admin" ? "admin" : "settings";
+
+    const verifier = createVerifier();
+    return context.json({
+      authorizationUrl: authorizationUrlFor({
+        auth: entry.auth,
+        clientId: client.clientId,
+        redirectUri: redirectUriFor(connect.publicUrl),
+        state: signConnectState(
+          { userId: context.var.actor.id, serverId, verifier, returnTo },
+          connect.encryptionKey,
+        ),
+        codeChallenge: challengeFor(verifier),
+      }),
+    });
+  });
+
+  /**
+   * Where the vendor sends somebody back.
+   *
+   * Deliberately not behind `requireUser`. The person arrives on a redirect from another company's
+   * server, and whose connection this is comes from the signed state rather than from whatever
+   * session the browser happens to be carrying — which is what stops a callback delivered to the
+   * wrong browser from attaching one person's Google account to another person's row.
+   *
+   * Every failure ends the same way: back at Settings with a word about what happened, and nothing
+   * written. There is no useful distinction here for the person between a forged state and an expired
+   * one, and spelling out which is which tells anybody probing this endpoint how far they got.
+   */
+  routes.get("/oauth/callback", async (context) => {
+    const failed = connectedAccountsUrlFor(connect?.appUrl, {
+      failed: true,
+    });
+    if (!connect?.publicUrl) return context.redirect(failed);
+
+    const code = context.req.query("code");
+    const state = readConnectState(
+      context.req.query("state") ?? "",
+      connect.encryptionKey,
+    );
+    if (!code || !state) return context.redirect(failed);
+
+    const entry = catalogueEntry(state.serverId);
+    if (entry?.auth.kind !== "user-oauth") return context.redirect(failed);
+
+    const client = await store.oauthClientFor(state.serverId);
+    if (!client) return context.redirect(failed);
+
+    const grant = await redeemAuthorizationCode({
+      tokenUrl: entry.auth.tokenUrl,
+      clientId: client.clientId,
+      clientSecret: client.clientSecret,
+      code,
+      redirectUri: redirectUriFor(connect.publicUrl),
+      verifier: state.verifier,
+    });
+    if (!grant) return context.redirect(failed);
+
+    await store.recordConnection({
+      serverId: state.serverId,
+      userId: state.userId,
+      refreshToken: grant.refreshToken,
+      scope: grant.scope,
+    });
+
+    return context.redirect(
+      connectedAccountsUrlFor(
+        connect.appUrl,
+        { serverId: state.serverId },
+        // From the signed state, so the destination is one this deployment chose, not the browser.
+        state.returnTo,
+      ),
+    );
   });
 
   /**
@@ -354,6 +590,11 @@ export function createPluginRoutes(
    * The grant, the policy and the audit row all happen inside the store, so this endpoint cannot
    * accidentally satisfy one of them and skip another. A refusal comes back as 403 with the reason
    * the model and the person are both shown, which is the same sentence written to the trail.
+   *
+   * NOTHING IN THIS REPOSITORY CALLS IT. It is what the browser used to post to when a Bot's tool
+   * loop ran client-side; that loop moved to the server, and the client helper for this went with it.
+   * Kept rather than removed, because #37 hardened it with `canUseBot` after that move — so removing
+   * it belongs in a change that says so, not in a merge resolution.
    */
   routes.post("/call", requireUser, async (context) => {
     const body = (await context.req.json().catch(() => null)) as {
@@ -377,7 +618,19 @@ export function createPluginRoutes(
         ref: body.ref,
         args: body.args ?? {},
         botId: body.agentId,
-        actorId: actorEmail(context),
+        /*
+         * The user id, not the address.
+         *
+         * `callTool` keys a per-person connection on `users.id`, so an address here finds nothing and
+         * every call through this route would be answered "you have not connected your account" —
+         * about a connector the person has connected. It never surfaced because a Bot's own tool loop
+         * runs on the server and does not come through here.
+         *
+         * The other uses of `actorEmail` in this file are `by:` on configuration changes, where an
+         * address is the useful thing to record. This one is an identity being resolved, not a name
+         * being written down, and the two are not interchangeable.
+         */
+        actorId: context.var.actor.id,
       });
       return context.json(result);
     } catch (error) {

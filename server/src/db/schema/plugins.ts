@@ -7,8 +7,9 @@ import {
   text,
   timestamp,
   uniqueIndex,
+  uuid,
 } from "drizzle-orm/pg-core";
-import { agents, users } from "./core";
+import { agents, credentials, users } from "./core";
 import { jsonb } from "./json";
 
 const createdAt = () =>
@@ -60,8 +61,21 @@ export const mcpServers = pgTable("mcp_servers", {
    *
    * A pointer rather than the secret: the vault owns encryption, rotation and revocation, and a
    * second copy of a token here would be a second thing to remember to revoke.
+   *
+   * A REAL foreign key, where this was `text` against a `uuid` primary key with none. That is not a
+   * typing nicety. The database was willing to hold a pointer to a credential row that did not
+   * exist, and it did: a test deleted the credential an administrator had registered and left this
+   * column addressing nothing, so the connector reported "no OAuth client registered yet" while the
+   * row still looked configured. Nothing caught it because nothing was checking.
+   *
+   * `restrict`, not `cascade` or `set null`. A credential this server points at should not be
+   * removable out from under it — the two legitimate ways to change it are replacing it, which
+   * repoints this column first, and removing the server, which takes the row with it. Anything else
+   * is a mistake, and should be refused rather than silently tidied into a working-looking state.
    */
-  credentialId: text("credential_id"),
+  credentialId: uuid("credential_id").references(() => credentials.id, {
+    onDelete: "restrict",
+  }),
   /** What the deployment last heard back from it. `null` until the first successful listing. */
   toolsRefreshedAt: timestamp("tools_refreshed_at", { withTimezone: true }),
   /** The last failure, kept so the Plugins page can say why a server has no tools. */
@@ -94,6 +108,73 @@ export const mcpTools = pgTable(
     createdAt: createdAt(),
   },
   (table) => [primaryKey({ columns: [table.serverId, table.name] })],
+);
+
+/**
+ * One person's grant on one MCP server: the row that makes a Bot answer as the asker.
+ *
+ * A table rather than a column, and this is the whole architectural point of the knowledge lane.
+ * `mcp_servers.credential_id` holds what the DEPLOYMENT has — for a `user-oauth` vendor that is the
+ * OAuth client, which reaches nobody's documents by itself. What reaches somebody's documents is
+ * here, one row per person, and a call picks the row belonging to whoever asked. Two people asking
+ * the same question therefore get the answers their own accounts can see, and neither can be served
+ * the other's.
+ *
+ * The key is the pair. "Which credential serves this server for this person" must have exactly one
+ * answer: with a surrogate id and no unique constraint, two rows for one pair are legal, and then
+ * the answer is whichever the query happened to order first — so somebody who reconnected could keep
+ * being served the grant they thought they had replaced.
+ *
+ * A pointer to the vault, never the secret, the same as everywhere else. The vault owns encryption,
+ * rotation and revocation, and a second copy of a refresh token here would be a second thing to
+ * remember to revoke when somebody disconnects.
+ */
+export const mcpUserCredentials = pgTable(
+  "mcp_user_credentials",
+  {
+    serverId: text("server_id")
+      .notNull()
+      .references(() => mcpServers.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /**
+     * The vault row holding this person's refresh token.
+     *
+     * A real foreign key, unlike {@link mcpServers.credentialId}, which is `text` against a `uuid`
+     * primary key and so references nothing the database will check. The new table does not copy
+     * that.
+     *
+     * Deliberately not cascading. A revoked credential row is kept for the trail, and deleting the
+     * row that says whose it was would take the trail with it.
+     */
+    credentialId: uuid("credential_id")
+      .notNull()
+      .references(() => credentials.id),
+    /**
+     * What the vendor actually granted, as it said it — not what we asked for.
+     *
+     * The two differ in practice: a person can decline part of a consent screen. Storing the reply
+     * rather than the request means a tool failing for want of a scope can be explained instead of
+     * being a mystery about a permission we assumed we had.
+     */
+    scope: text("scope").notNull(),
+    /**
+     * When this person connected.
+     *
+     * Written out rather than using the shared `createdAt()` helper, which fixes the column name to
+     * `created_at`. This row records an act somebody performed and a date they are shown on their
+     * own settings page, so it is worth the column saying which act.
+     */
+    connectedAt: timestamp("connected_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: updatedAt(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.serverId, table.userId] }),
+    index("mcp_user_credentials_user_idx").on(table.userId),
+  ],
 );
 
 /**

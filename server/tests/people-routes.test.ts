@@ -64,8 +64,16 @@ function appWith(
       api: { getSession: async () => ({ user: ADMIN }) },
     } as never,
     { rolesForUser: async () => [role] },
-    // Positions 4-18 are the other stores; people is last.
-    ...(Array.from({ length: 15 }) as never[]),
+    /*
+     * Positions 4-17 are the other stores; `store` is 18, peopleStore.
+     *
+     * Fourteen, not fifteen. This arrived from main written against a signature that still had
+     * `connectorService`, which the knowledge lane removed along with the connector it served — so
+     * the count is one shorter here. Every parameter from 4 on is optional, so getting it wrong is a
+     * silent type-check pass: the store lands in `ssoProviderCount`, the people routes see no store,
+     * and every test below fails with a 503 that says nothing about why.
+     */
+    ...(Array.from({ length: 14 }) as never[]),
     store as never,
   );
 

@@ -158,6 +158,70 @@ export function saveSkillMutationOptions(queryClient: QueryClient) {
   });
 }
 
+/** The deployment's OAuth client for a vendor reached as the person asking. */
+export type OAuthClientInput = {
+  serverId: string;
+  clientId: string;
+  clientSecret: string;
+};
+
+/**
+ * Register the deployment's OAuth client for a `user-oauth` server.
+ *
+ * Its own write rather than a field on the curated-server input, because it has its own lifetime: a
+ * client is rotated without the server being re-added, and re-adding a server should not mean
+ * re-typing a client. It is also recorded against the server row, so it can only happen once that
+ * row exists — which is why the page chains it rather than sending both at once.
+ *
+ * Nobody's documents are reachable with what this sends. A client identifies this deployment to the
+ * vendor; the grant that reads anything belongs to each person and is made on their own settings page.
+ */
+export function registerOAuthClientMutationOptions(queryClient: QueryClient) {
+  return mutationOptions({
+    mutationFn: async (input: OAuthClientInput) => {
+      await client(
+        `/api/plugins/servers/${encodeURIComponent(input.serverId)}/oauth-client`,
+        {
+          method: "POST",
+          body: { clientId: input.clientId, clientSecret: input.clientSecret },
+          fallback: "That OAuth client could not be registered.",
+        },
+      );
+    },
+    onSuccess: () => invalidatePlugins(queryClient),
+  });
+}
+
+/**
+ * Begin connecting the signed-in person's own account.
+ *
+ * Answers with the vendor's consent URL rather than navigating, so the caller decides when to leave
+ * the page. There is deliberately nothing here that could complete the consent on somebody's behalf.
+ */
+/**
+ * Start a consent flow, and say which screen it started from.
+ *
+ * `returnTo` decides where the vendor's callback puts somebody down, because two screens offer this:
+ * a person's own connected-accounts page, and the connector's admin page where an administrator
+ * verifies the setup they have just finished. Sending an administrator to their personal settings
+ * afterwards is the round trip the inline row exists to remove.
+ *
+ * A name rather than a URL. The server narrows it to a known set before signing it into the state,
+ * so this parameter cannot become an open redirect however it is called.
+ */
+export function connectAccountMutationOptions(
+  returnTo: "settings" | "admin" = "settings",
+) {
+  return mutationOptions({
+    mutationFn: (serverId: string): Promise<string> =>
+      client<string>(
+        `/api/plugins/servers/${encodeURIComponent(serverId)}/connect?returnTo=${returnTo}`,
+        "authorizationUrl",
+        { method: "POST", fallback: "That account could not be connected." },
+      ),
+  });
+}
+
 export function removeSkillMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
     mutationFn: async (slug: string) => {

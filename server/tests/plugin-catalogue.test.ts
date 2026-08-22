@@ -19,38 +19,53 @@ import {
 
 describe("which servers this deployment will talk to", () => {
   test("a pinned host matches only itself", () => {
-    const atlassian = catalogueEntry("atlassian");
-    expect(atlassian).not.toBeNull();
-    expect(hostAdmissible(atlassian!, "https://mcp.atlassian.com")).toBe(true);
+    const drive = catalogueEntry("google-drive");
+    expect(drive).not.toBeNull();
+    expect(hostAdmissible(drive!, "https://www.googleapis.com")).toBe(true);
     // A prefix, a suffix and a lookalike are each refused. The suffix case is the one that matters:
     // a check written with endsWith rather than equality would accept it.
-    expect(
-      hostAdmissible(atlassian!, "https://mcp.atlassian.com.evil.test"),
-    ).toBe(false);
-    expect(
-      hostAdmissible(atlassian!, "https://evil.test/mcp.atlassian.com"),
-    ).toBe(false);
-    expect(hostAdmissible(atlassian!, "http://mcp.atlassian.com")).toBe(false);
+    expect(hostAdmissible(drive!, "https://www.googleapis.com.evil.test")).toBe(
+      false,
+    );
+    expect(hostAdmissible(drive!, "https://evil.test/www.googleapis.com")).toBe(
+      false,
+    );
+    expect(hostAdmissible(drive!, "http://www.googleapis.com")).toBe(false);
+    // The MCP host this entry used to name. Now inadmissible, which is the point of pinning: moving
+    // the entry to the GA API is also a decision to stop talking to the preview endpoint.
+    expect(hostAdmissible(drive!, "https://drivemcp.googleapis.com")).toBe(
+      false,
+    );
   });
 
-  test("a per-instance vendor accepts its own instances and nothing else", () => {
-    const servicenow = catalogueEntry("servicenow");
-    expect(servicenow).not.toBeNull();
-    expect(hostAdmissible(servicenow!, "https://acme.service-now.com")).toBe(
-      true,
-    );
-    expect(
-      hostAdmissible(servicenow!, "https://acme-dev1.service-now.com"),
-    ).toBe(true);
-    // Anchored at both ends, so neither a prefix nor a suffix gets in.
-    expect(
-      hostAdmissible(servicenow!, "https://acme.service-now.com.evil.test"),
-    ).toBe(false);
-    expect(
-      hostAdmissible(servicenow!, "https://evil.test#acme.service-now.com"),
-    ).toBe(false);
-    // A subdomain of an instance is not an instance.
-    expect(hostAdmissible(servicenow!, "https://a.b.service-now.com")).toBe(
+  test("an entry whose pattern this build never compiled is refused", () => {
+    /*
+     * WHAT THIS NO LONGER COVERS. ServiceNow was the only per-instance entry, and removing it took
+     * the anchored-pattern assertions with it — that a prefix, a suffix and a subdomain are each
+     * refused. `PATTERNS` is compiled from the catalogue by key, so a synthetic entry cannot reach a
+     * pattern and there is no way left to exercise the matching itself through the public API.
+     *
+     * What survives is the fail-closed half, which is worth keeping on its own: an entry claiming to
+     * be per-instance that this build has no pattern for is refused rather than admitted. Whoever
+     * adds the next per-instance vendor should restore the anchoring cases with it.
+     */
+    const perInstance = {
+      key: "google-drive",
+      title: "Per-instance vendor",
+      vendor: "Example",
+      summary: "",
+      host: null,
+      hostPattern:
+        "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)\\.service-now\\.com$",
+      path: "/mcp",
+      auth: { kind: "deployment-bearer" },
+      writeTools: [],
+      docsUrl: "",
+    } as const;
+
+    // `PATTERNS` is compiled from the catalogue by key, so a synthetic entry reaches no pattern and
+    // is refused outright. That is itself the fail-closed property: no pattern means no.
+    expect(hostAdmissible(perInstance, "https://acme.service-now.com")).toBe(
       false,
     );
   });
@@ -61,19 +76,11 @@ describe("which servers this deployment will talk to", () => {
   });
 
   test("the path is the catalogue's, never the caller's", () => {
-    // A per-instance vendor is the only case where a caller supplies any part of the address, and
-    // even then the path is fixed, so an admissible host cannot reach another endpoint.
-    const resolved = resolveServerUrl(
-      "servicenow",
-      "https://acme.service-now.com",
+    // An instance host offered for a vendor with a pinned host is ignored, not honoured: the host and
+    // the path both come from the entry, so nothing a caller sends can reach another endpoint.
+    expect(resolveServerUrl("google-drive", "https://evil.test").url).toBe(
+      "https://www.googleapis.com/drive/v3",
     );
-    expect(resolved?.url).toBe(
-      "https://acme.service-now.com/sncapps/mcp-server",
-    );
-  });
-
-  test("a per-instance vendor with no instance supplied resolves to nothing", () => {
-    expect(resolveServerUrl("servicenow")).toBeNull();
   });
 
   test("every catalogue entry pins a host or an anchored pattern", () => {
@@ -90,33 +97,113 @@ describe("which servers this deployment will talk to", () => {
   });
 });
 
+describe("whose credential a server uses", () => {
+  test("every entry says which, rather than leaving it to be inferred", () => {
+    // The whole point of replacing a `needsCredential` boolean. "Needs a credential" did not say
+    // whose, and a reader who guessed would guess the deployment's, which for a user-oauth vendor
+    // is the one answer that breaks the promise the connector exists to keep.
+    for (const entry of CATALOGUE) {
+      expect(["none", "deployment-bearer", "user-oauth"]).toContain(
+        entry.auth.kind,
+      );
+    }
+  });
+
+  test("a user-oauth entry pins its own endpoints over https and asks for a scope", () => {
+    for (const entry of CATALOGUE) {
+      if (entry.auth.kind !== "user-oauth") continue;
+      // Pinned for the same reason the MCP host is: these are addresses this deployment sends a
+      // person's authorization code and receives their refresh token at.
+      expect(entry.auth.authorizationUrl.startsWith("https://")).toBe(true);
+      expect(entry.auth.tokenUrl.startsWith("https://")).toBe(true);
+      expect(entry.auth.revokeUrl.startsWith("https://")).toBe(true);
+      // No scopes means consent to nothing, which would fail at the vendor with a message that
+      // does not name us.
+      expect(entry.auth.scopes.length).toBeGreaterThan(0);
+    }
+  });
+
+  test("a vendor this build has never heard of is not an entry", () => {
+    // The five bearer vendors that used to be asserted here are gone. What matters now is the same
+    // property from the other side: a key with no entry resolves to nothing rather than to a default.
+    for (const key of [
+      "atlassian",
+      "box",
+      "slack",
+      "salesforce",
+      "servicenow",
+    ]) {
+      expect(catalogueEntry(key)).toBeNull();
+      expect(resolveServerUrl(key)).toBeNull();
+    }
+  });
+});
+
+describe("Google Drive", () => {
+  const drive = catalogueEntry("google-drive");
+
+  test("resolves to the one address Google publishes for it", () => {
+    expect(drive).not.toBeNull();
+    /*
+     * The GA REST API, not the MCP server. Google publishes both; the MCP one is gated behind the
+     * Workspace Developer Preview Program and refuses an unenrolled project with a message about
+     * permission that describes the project rather than the credential. Swapping back is `transport`
+     * plus these two fields, which is why the transport is asserted alongside the address.
+     */
+    expect(resolveServerUrl("google-drive")?.url).toBe(
+      "https://www.googleapis.com/drive/v3",
+    );
+    expect(drive?.transport).toBe("google-drive-rest");
+  });
+
+  test("is reached as the person asking, not as the deployment", () => {
+    expect(drive?.auth.kind).toBe("user-oauth");
+  });
+
+  test("asks only to read", () => {
+    // K1 answers questions and writes nothing. A wider scope would be granted by every person who
+    // connects and used by nothing, which is the kind of permission nobody remembers agreeing to.
+    expect(drive?.auth.kind === "user-oauth" ? drive.auth.scopes : []).toEqual([
+      "https://www.googleapis.com/auth/drive.readonly",
+    ]);
+  });
+
+  test("still calls its writes writes, and lets Google be the one to refuse them", () => {
+    // The read-only scope means these fail at the vendor. They stay classified as writes anyway, so
+    // a boundary written about writes keeps covering them if the scope ever widens.
+    expect(classifyTool(drive, "create_file", true)).toBe("write");
+    expect(classifyTool(drive, "copy_file", true)).toBe("write");
+    expect(classifyTool(drive, "search_files", true)).toBe("read");
+    expect(classifyTool(drive, "read_file_content", true)).toBe("read");
+  });
+});
+
 describe("what a tool does", () => {
-  const atlassian = catalogueEntry("atlassian")!;
+  const drive = catalogueEntry("google-drive")!;
 
   test("a named write is a write", () => {
-    expect(classifyTool(atlassian, "createJiraIssue", true)).toBe("write");
+    expect(classifyTool(drive, "create_file", true)).toBe("write");
   });
 
   test("an advertised tool that is not a named write is a read", () => {
-    expect(classifyTool(atlassian, "searchJiraIssues", true)).toBe("read");
+    expect(classifyTool(drive, "search_files", true)).toBe("read");
   });
 
   test("a tool the server never advertised is a write", () => {
     // The only thing that produced this name was a model, so nothing has vouched for it.
-    expect(classifyTool(atlassian, "searchJiraIssues", false)).toBe("write");
+    expect(classifyTool(drive, "search_files", false)).toBe("write");
   });
 
   test("every tool on a server nobody reviewed is a write", () => {
     expect(classifyTool(null, "anything_at_all", true)).toBe("write");
   });
 
-  test("a tool that edits rather than creates is still a write", () => {
-    // The naming does not carry it: "update" and "create" both change somebody else's system, and a
-    // list built by reading verbs off tool names lets the edits through.
-    const slack = catalogueEntry("slack")!;
-    expect(classifyTool(slack, "slack_update_canvas", true)).toBe("write");
-    expect(classifyTool(slack, "slack_create_canvas", true)).toBe("write");
-    expect(classifyTool(slack, "slack_read_canvas", true)).toBe("read");
+  test("copying is a write, and reading a file's content is not", () => {
+    // `copy_file` is the case a list built by reading verbs off tool names would miss: it creates
+    // nothing named "create" and still puts a new object in somebody's Drive.
+    expect(classifyTool(drive, "copy_file", true)).toBe("write");
+    expect(classifyTool(drive, "read_file_content", true)).toBe("read");
+    expect(classifyTool(drive, "get_file_metadata", true)).toBe("read");
   });
 });
 

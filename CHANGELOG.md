@@ -30,6 +30,25 @@ digit. The same rule container and volume names have always followed. A deployme
 `AUDIT_RETENTION_DAYS` is new and unset, which keeps the audit trail forever, as before. Set it to a
 whole number of days to have old rows removed.
 
+**An MCP server pointed at a credential that no longer exists loses the pointer.** `mcp_servers`
+now names its credential with a real foreign key, where the column was `text` against a `uuid`
+primary key with nothing checking it — so a deployment is allowed to be holding a pointer to a vault
+row that was deleted underneath it, and the screens read as though the server were still configured.
+The migration clears those before adding the key, because it cannot add it otherwise. If this
+happens, that connector correctly reports having no credential and an administrator registers it
+again; nothing else is affected, and a deployment with no such pointer sees nothing.
+
+**The old Google Drive connector is gone, and it is not the new one renamed.** It configured a
+service account with domain impersonation and had the worker sync documents into a local pgvector
+index guarded by our own ACL rows, so every person got the same answer computed from what one
+credential could see, and revoking somebody's access left a cached copy of their documents behind.
+`/admin/connectors` and its two screens, the connector catalogue and admin service, the sync
+persistence and the worker's connector runner have all been removed. A deployment that was syncing
+this way stops syncing and should enable the new connector at `/admin/plugins/google-drive`, where
+each person connects their own account.
+
+`knowledge.yaml` is still parsed and still refused when malformed, because it is part of the
+deployment-package contract. Its `sources:` are now read by nothing.
 `MANAGED_AGENT_AG_UI_URL` is no longer required to start. The one-container image does not carry a
 Bot, so requiring it registered the shipped Risk Analyst against a host that was not there and every
 conversation with it failed. Leave it unset for that image. A laptop `scripts/start.sh` still points
@@ -63,6 +82,46 @@ Sessions survive and nobody signs in again.
   and skips routing entirely. If the router is uncertain or unreachable, it falls back to the same
   default the composer always used, and says so, rather than misroute or drop.
 
+- **A Bot can answer from Google Drive, as the person asking.** Ask a Bot a question whose answer is
+  in a document and it answers from the live file rather than from an index, citing a link that opens
+  it. A Bot granted these tools reads Drive on the asker's own grant, so two people asking the same
+  question get the answers their own accounts can see, and neither sees the other's documents.
+  Read-only: the scope requested is `drive.readonly`, so a write is refused by Google before this
+  deployment has to. Nothing is cached — the refresh token is stored and an access token is minted
+  per call, so revoking access at Google takes effect on the next one rather than when a cache
+  expires.
+
+  Setting it up takes two people and neither can do the other's half. An administrator registers a
+  Google Cloud OAuth client and enables the connector at `/admin/plugins/google-drive`; each person
+  then connects their own account, and there is deliberately no endpoint for an administrator to
+  connect one on somebody's behalf. The redirect URI has to match what is registered character for
+  character, and the connector page states the exact string to paste, because a mismatch fails at
+  Google with a message that never mentions OpenBot. See
+  [docs/plugins/google-drive.md](docs/plugins/google-drive.md) for the whole setup and for what each
+  failure means.
+
+  **Disconnecting is not built yet.** The account page says so and points at Google's own third-party
+  access settings, which is what withdraws it today.
+- **Each tool a connector offers has its own screen**, at `/admin/plugins/<connector>/tools/<tool>`,
+  with a switch per Bot. The connector page previously drew a button per Bot inside every tool row,
+  which is a control per Bot per tool stacked in one list, and grew without bound as Bots were added.
+- **Connected accounts**, at `/settings/connected-accounts`. What a Bot may read as you, and the
+  scope the vendor actually granted rather than the one that was asked for.
+- **A tool result that found nothing says so.** An empty result used to reach the model as an empty
+  string, which reads as "the tool had nothing to say" rather than "there is nothing there" — and a
+  model closes that gap from memory, which for a knowledge connector is the failure worth preventing.
+- **The shipped Knowledge Bot answers from the tools it has.** Its instructions in
+  `examples/fintech` told it to say no source was connected, which was honest when none could be:
+  the connector this replaces had been removed and nothing had taken its place. With a connector
+  granted it became the opposite of honest — the Bot called a tool, was handed a file listing, and
+  said it had no access anyway. It now reports what its tools return, says so plainly when it has no
+  tool or a tool reports a problem, and does neither of the two things worth forbidding: answering
+  from its own memory as though it came from a source, or claiming to lack access to something a tool
+  has just returned. A deployment with its own tenant package is unaffected.
+- **`mcp.call_failed`.** A call this deployment permitted and the vendor did not complete now leaves
+  a row of its own, carrying the vendor's own sentence. `mcp.call_succeeded` was written before the
+  network call rather than after, so a call that died at the vendor recorded success and the Admin
+  page agreed with it.
 - **Releases are cut by a workflow, not by hand.** `Create release PR` bumps the version and promotes
   `## Unreleased` to a numbered section; merging the pull request it opens is what publishes. Merging
   builds and pushes one image to `ghcr.io/copilotkit/openbot`, signs a build provenance attestation
@@ -125,6 +184,16 @@ Sessions survive and nobody signs in again.
   is unavailable never blocks a sign-in.
 
 ### Fixed
+- **Removing somebody left the credentials they had granted this deployment sitting in the vault.**
+  Removing them from the People screen ended their sessions and stopped the next sign-in, and left the
+  refresh token behind, unrevoked. They could not use it — the account comes from a session they no
+  longer get — but "we removed their access" was not true of the token, which for a connector read as
+  the person asking is the part that matters. Removing somebody now retires it, and each retirement is
+  on the audit trail as `mcp.account_disconnected`. Deleting a person's row used to be worse, because
+  it took the connection record with it and left the credential reachable by nothing at all; those are
+  found and retired too. This stops the deployment holding a usable secret. It does **not** withdraw
+  the grant at the vendor, which needs revoking there until disconnect ships, and the audit row says
+  which of the two happened rather than implying both.
 - **The one-container image registered a coworker it could not run.** `MANAGED_AGENT_AG_UI_URL`
   defaulted to `localhost:4201` and was required, so Risk Analyst appeared on the roster and every
   conversation with it failed. The URL is optional; the package omits that coworker when it is

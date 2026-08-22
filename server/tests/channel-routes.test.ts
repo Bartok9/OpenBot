@@ -305,9 +305,9 @@ describe("channel route composition", () => {
         api: { getSession: async () => session },
       },
       { rolesForUser: async () => ["user"] },
-      // Positions 4-11, ending at agentProfileStore. The computer gateway and policy store come
-      // before these placeholders.
-      undefined,
+      // Positions 4-10, ending at agentProfileStore. `store` is position 11, channelStore. One
+      // shorter than either side of the merge that produced this: see agent-routes.test.ts for why
+      // a wrong count here fails silently rather than as a type error.
       undefined,
       undefined,
       undefined,

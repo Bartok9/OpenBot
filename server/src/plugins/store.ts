@@ -7,13 +7,19 @@ import {
 } from "../computer/policy";
 import {
   type CredentialSecretReader,
+  type CredentialStore,
   decryptCredentialForUse,
+  encryptSecret,
 } from "../credentials";
 import type { Database } from "../db/client";
 import {
   agentProfiles,
+  // Aliased: `credentials` is already the injected vault interface in this module, and the table and
+  // the interface are two different things to reach for.
+  credentials as credentialRows,
   mcpServers,
   mcpTools,
+  mcpUserCredentials,
   pluginGrants,
   skills,
 } from "../db/schema";
@@ -24,7 +30,8 @@ import {
   customUrlRefusal,
   resolveServerUrl,
 } from "./catalogue";
-import { callTool as callRemoteTool, listTools, McpServerError } from "./mcp";
+import { McpServerError } from "./mcp";
+import { transportFor } from "./transport";
 
 /**
  * Plugins: what this deployment has added, which Bots may use it, and the one path a call takes.
@@ -152,17 +159,153 @@ export function refFromToolName(toolName: string): string | null {
 const iso = (value: Date | string | null): string | null =>
   value === null ? null : value instanceof Date ? value.toISOString() : value;
 
+/**
+ * Whose credential reaches this server, as the trail names it.
+ *
+ * One definition, because this was two: `connectionTokenFor` returned it and the audit payload
+ * recomputed the same condition a few lines later. Two expressions for one fact can disagree, and
+ * the one place that would show is an audit row claiming a call ran as somebody it did not — which is
+ * the row a per-person connector exists to be able to trust.
+ *
+ * `deployment` for a shared token; the asker's own id for a server reached as the person asking.
+ */
+const reachedAsFor = (entry: CatalogueEntry | null, actorId: string): string =>
+  entry?.auth.kind === "user-oauth" ? actorId : "deployment";
+
+/**
+ * Where this server actually is, when the stored row and the catalogue disagree.
+ *
+ * `mcp_servers.url` is written once, when a server is added, by copying what the catalogue said at
+ * the time. That makes it a cache of a reviewed decision — and a cache nothing invalidates. Moving
+ * Google Drive from its preview MCP host to its GA REST host changed the catalogue and left every
+ * deployment that had already added Drive calling the old address, with no way to tell from any
+ * screen: the row looks exactly as intentional as it did the day it was written.
+ *
+ * So for an entry with a PINNED host, the catalogue wins. It is the reviewed source contract, and a
+ * host it no longer names is a host this deployment has decided not to talk to. Editing the
+ * catalogue is the act of changing where a first-party server is, and it should take effect.
+ *
+ * The stored value still wins for the two cases where it is the only truth: a custom server an
+ * administrator added by URL, which has no entry at all, and a per-instance vendor whose `host` is
+ * null because the customer's own hostname is the answer.
+ */
+function effectiveUrl(
+  row: { id: string; url: string },
+  entry: CatalogueEntry | null,
+): string {
+  if (!entry || entry.host === null) return row.url;
+  return resolveServerUrl(row.id)?.url ?? row.url;
+}
+
+/**
+ * Trade a refresh token for a short-lived access token, at the vendor's own token endpoint.
+ *
+ * `tokenUrl` comes from the catalogue entry and never from a caller, for the same reason the MCP
+ * host does not: this request carries the deployment's client secret and somebody's refresh token,
+ * so where it goes is a reviewed decision rather than a runtime one.
+ *
+ * The vendor's error body is deliberately not passed through. It is written for whoever registered
+ * the client, not for the person who asked a Bot a question, and it can name the client id.
+ */
+async function exchangeRefreshTokenOverHttp(input: {
+  tokenUrl: string;
+  client: OAuthClient;
+  refreshToken: string;
+}): Promise<AccessToken> {
+  const response = await fetch(input.tokenUrl, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: input.refreshToken,
+      client_id: input.client.clientId,
+      client_secret: input.client.clientSecret,
+    }),
+    signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS),
+  });
+
+  if (!response.ok) {
+    throw new McpServerError(
+      `The vendor would not renew this access (${response.status}).`,
+    );
+  }
+
+  const body = (await response.json()) as {
+    access_token?: unknown;
+    expires_in?: unknown;
+  };
+  if (typeof body.access_token !== "string" || !body.access_token) {
+    throw new McpServerError("The vendor renewed this access with no token.");
+  }
+  return {
+    accessToken: body.access_token,
+    expiresInSeconds:
+      typeof body.expires_in === "number" ? body.expires_in : undefined,
+  };
+}
+
+/** How long a vendor's token endpoint gets. Shorter than a call: it is one round trip, or nothing. */
+const TOKEN_TIMEOUT_MS = 10_000;
+
+/**
+ * The deployment's OAuth client for one vendor, as it is held in the vault.
+ *
+ * Both halves live in the encrypted value rather than the id sitting in `metadata` and the secret
+ * here. One read gets a usable client, which keeps {@link CredentialSecretReader} the only vault
+ * interface this module needs. The id is also copied into `metadata` for the credentials page to
+ * show — a deliberate duplication of something that is not a secret, so that a screen listing what
+ * the deployment holds does not have to decrypt anything to name it.
+ */
+export type OAuthClient = { clientId: string; clientSecret: string };
+
+/** What a vendor's token endpoint gave back for a refresh token. */
+export type AccessToken = { accessToken: string; expiresInSeconds?: number };
+
 export type PluginStoreOptions = {
   database: Database;
   auditStore: AuditStore;
-  credentials: CredentialSecretReader;
+  /**
+   * The vault, read and write.
+   *
+   * Writing is here rather than left to the browser posting `/api/admin/credentials` first. An OAuth
+   * client belongs to the server registration and a refresh token belongs to a connection, so both
+   * are written by the code that owns those acts — otherwise the first of two calls can succeed and
+   * the second fail, leaving a secret in the vault that nothing points at and nobody knows to revoke.
+   */
+  credentials: CredentialSecretReader & CredentialStore;
   encryptionKey: string;
   /** Read at call time, never captured, so a policy changed a moment ago applies to this call. */
   policy: () => ActionPolicy;
+  /**
+   * Speaking MCP to the vendor. Defaults to the real client.
+   *
+   * Injected so a test can assert what a call was about to go out with. Whose credential is chosen
+   * is the security property of this module, and asserting it otherwise needs a vendor to be
+   * reachable, which means the property most worth testing would be the one thing never tested.
+   */
+  callVendor?: (
+    connection: { url: string; token?: string },
+    toolName: string,
+    args: Record<string, unknown>,
+  ) => Promise<{ text: string; isError: boolean }>;
+  /** Trading a refresh token for a short-lived access token. Defaults to a real HTTP exchange. */
+  exchangeRefreshToken?: (input: {
+    tokenUrl: string;
+    client: OAuthClient;
+    refreshToken: string;
+  }) => Promise<AccessToken>;
 };
 
 export function createPluginStore(options: PluginStoreOptions) {
   const { database, auditStore, credentials, encryptionKey } = options;
+  /*
+   * Held rather than resolved, because the transport is a property of the entry and is not known
+   * until a call names one. An injected vendor still wins over both, which is what keeps a test able
+   * to assert what a call was about to go out with.
+   */
+  const injectedVendor = options.callVendor;
+  const exchangeRefreshToken =
+    options.exchangeRefreshToken ?? exchangeRefreshTokenOverHttp;
 
   async function grantsFor(kind: PluginKind, refs: string[]) {
     if (refs.length === 0) return new Map<string, string[]>();
@@ -184,12 +327,123 @@ export function createPluginStore(options: PluginStoreOptions) {
    * there does not fail loudly: the insert violates the constraint and the entire audit row is lost.
    */
 
-  /** The credential for a server, decrypted for one call and never held. */
-  async function tokenFor(
-    credentialId: string | null,
-  ): Promise<string | undefined> {
-    if (!credentialId) return undefined;
-    return decryptCredentialForUse(encryptionKey, credentials, credentialId);
+  /**
+   * A credential out of the vault, decrypted for one call and never held.
+   *
+   * A revoked credential is turned into a refusal rather than left as the vault's thrown error. The
+   * two reach a person very differently: an error becomes "that tool could not be called", which is
+   * what a vendor being down looks like, while a withdrawn grant is nobody's fault and has an
+   * obvious next step. `reconnect` says which of the two to name.
+   */
+  async function secretFor(
+    credentialId: string,
+    onRevoked: string,
+  ): Promise<string> {
+    try {
+      return await decryptCredentialForUse(
+        encryptionKey,
+        credentials,
+        credentialId,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("revoked") || message.includes("not found")) {
+        throw new PluginRefusedError(onRevoked, null);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * The token one call goes out with, and whose it is.
+   *
+   * For a `deployment-bearer` server this is what it always was: the one credential an administrator
+   * gave the server, used for everybody.
+   *
+   * For a `user-oauth` server it is the asker's own, and every branch that cannot prove it has the
+   * asker's grant refuses. There is deliberately no fallback. A fallback is the one bug this design
+   * exists to make impossible: answering out of whatever the deployment, or the last person to
+   * connect, happened to be able to see — which returns a confident answer assembled from documents
+   * the person asking cannot open, and looks exactly like a correct answer.
+   *
+   * Nothing is cached. The refresh token is exchanged for an access token per call and the access
+   * token is thrown away, so there is no stored copy of anybody's access for a disconnect to have to
+   * find. That costs a round trip to the vendor's token endpoint on every call, which is the price
+   * of revocation being complete by construction rather than by cleanup.
+   */
+  async function connectionTokenFor(
+    row: { id: string; url: string; credentialId: string | null },
+    entry: CatalogueEntry | null,
+    actorId: string,
+  ): Promise<{ token?: string }> {
+    if (entry?.auth.kind !== "user-oauth") {
+      const token = row.credentialId
+        ? await secretFor(
+            row.credentialId,
+            `${row.id} needs a credential this deployment no longer holds. An administrator has to add it again.`,
+          )
+        : undefined;
+      return { token };
+    }
+
+    /*
+     * The anonymous actor is the empty string, and an empty string must never match a row.
+     *
+     * `identifyActor` answers with `{ id: "" }` when it cannot resolve who is asking. Letting that
+     * reach the lookup would mean a run nobody can be held accountable for picking up whichever
+     * grant sorted first, so it is refused before the query rather than trusted to miss.
+     */
+    if (!actorId) {
+      throw new PluginRefusedError(
+        `${row.id} answers as the person asking, and this run is not attributed to anybody.`,
+        null,
+      );
+    }
+
+    const [held] = await database
+      .select({ credentialId: mcpUserCredentials.credentialId })
+      .from(mcpUserCredentials)
+      .where(
+        and(
+          eq(mcpUserCredentials.serverId, row.id),
+          eq(mcpUserCredentials.userId, actorId),
+        ),
+      )
+      .limit(1);
+
+    if (!held) {
+      throw new PluginRefusedError(
+        `You have not connected your ${entry.title} account. Connect it in Settings and ask again.`,
+        null,
+      );
+    }
+
+    const refreshToken = await secretFor(
+      held.credentialId,
+      `Your ${entry.title} access was withdrawn. Connect it again in Settings.`,
+    );
+
+    if (!row.credentialId) {
+      // The person did their part; the deployment has not. Said plainly, because the person cannot
+      // fix it and should not be told to try.
+      throw new PluginRefusedError(
+        `${entry.title} has no OAuth client registered for this deployment, so this cannot be called. An administrator has to add one.`,
+        null,
+      );
+    }
+    const client = JSON.parse(
+      await secretFor(
+        row.credentialId,
+        `${entry.title} has no usable OAuth client for this deployment. An administrator has to add one again.`,
+      ),
+    ) as OAuthClient;
+
+    const minted = await exchangeRefreshToken({
+      tokenUrl: entry.auth.tokenUrl,
+      client,
+      refreshToken,
+    });
+    return { token: minted.accessToken };
   }
 
   async function requireServer(serverId: string) {
@@ -364,13 +618,54 @@ export function createPluginStore(options: PluginStoreOptions) {
      *
      * Replaced wholesale, never merged. A tool a vendor withdrew has to stop being offered, and a
      * merge would leave it in the list forever as a name the model will happily call.
+     *
+     * `actorId` is who is asking, and whether it is needed at all is the transport's answer rather
+     * than an assumption here. Where listing means asking a remote server — MCP — a `user-oauth`
+     * vendor has no deployment credential to ask with, so the listing runs on the grant of whoever
+     * pressed refresh, and an administrator who has not connected gets a refusal that lands in
+     * `lastError`. That is the honest state: until somebody has connected, this deployment genuinely
+     * does not know what that server offers.
+     *
+     * Where the tool list is this deployment's own code, nothing is asked and no credential is
+     * consulted. Requiring one anyway is what made setting Drive up a round trip through an
+     * administrator's personal settings page for a token that was then discarded.
+     *
+     * Absent for the refresh that happens right after a server is added, where nobody can have
+     * connected yet. It makes no difference to a `deployment-bearer` server, which never consults it.
      */
-    async refreshTools(serverId: string): Promise<{ tools: number }> {
-      const { row } = await requireServer(serverId);
+    async refreshTools(
+      serverId: string,
+      actorId = "",
+    ): Promise<{ tools: number }> {
+      const { row, entry } = await requireServer(serverId);
 
       try {
-        const token = await tokenFor(row.credentialId);
-        const tools = await listTools({ url: row.url, token });
+        // The entry decides the protocol. For a custom server there is no entry, and MCP is right.
+        const transport = transportFor(entry);
+
+        /*
+         * A credential only when listing actually needs one.
+         *
+         * Where it is needed, it is taken from the same selection the call path uses rather than by
+         * decrypting `row.credentialId` — which is what this used to do, and which for a `user-oauth`
+         * server would have sent the deployment's OAuth client secret to the vendor as somebody's
+         * access token. One answer to "what token does this server get", and it cannot be a secret of
+         * the wrong kind.
+         *
+         * Where it is NOT needed, asking anyway is not a harmless extra check. For a `user-oauth`
+         * server that call refuses unless the person pressing the button has connected their own
+         * account — so an administrator setting Drive up was blocked at "refresh tools" and sent to
+         * their personal settings page to grant access, so that a token could be minted and handed to
+         * a function that discards it. The gate outlived the reason for it.
+         */
+        const token = transport.listNeedsCredential
+          ? (await connectionTokenFor(row, entry, actorId)).token
+          : undefined;
+
+        const tools = await transport.listTools({
+          url: effectiveUrl(row, entry),
+          token,
+        });
 
         await database.delete(mcpTools).where(eq(mcpTools.serverId, serverId));
         if (tools.length > 0) {
@@ -440,7 +735,7 @@ export function createPluginStore(options: PluginStoreOptions) {
           id: row.id,
           title: row.title,
           vendor: row.vendor,
-          url: row.url,
+          url: effectiveUrl(row, entry),
           summary: entry?.summary ?? "",
           docsUrl: entry?.docsUrl ?? "",
           provenance: row.provenance,
@@ -689,6 +984,268 @@ export function createPluginStore(options: PluginStoreOptions) {
     },
 
     /**
+     * Register the deployment's OAuth client for a `user-oauth` server.
+     *
+     * Both halves go into one encrypted value, so a single vault read yields a usable client. The id
+     * is copied into `metadata` as well — it is not a secret, and a page listing what the deployment
+     * holds should be able to name it without decrypting anything.
+     *
+     * Replacing a client revokes the previous one rather than orphaning it, so "what does this
+     * deployment hold" keeps having one answer per server. Nobody's connection breaks: a refresh
+     * token is the person's, and it is the client that is being rotated underneath it.
+     */
+    async registerOAuthClient(input: {
+      serverId: string;
+      client: OAuthClient;
+      by: string;
+    }): Promise<void> {
+      const { row, entry } = await requireServer(input.serverId);
+      if (entry?.auth.kind !== "user-oauth") {
+        throw new CustomServerRefusedError(
+          `${input.serverId} is not reached with an OAuth client.`,
+        );
+      }
+
+      const stored = await credentials.create({
+        kind: "mcp_oauth_client",
+        provider: input.serverId,
+        keyId: `oauth-client-${input.serverId}`,
+        metadata: { server: input.serverId, clientId: input.client.clientId },
+        encryptedValue: await encryptSecret(
+          encryptionKey,
+          JSON.stringify(input.client),
+        ),
+      });
+
+      await database
+        .update(mcpServers)
+        .set({ credentialId: stored.id, updatedAt: new Date() })
+        .where(eq(mcpServers.id, input.serverId));
+
+      if (row.credentialId) {
+        await credentials.revoke(row.credentialId).catch(() => {
+          // A previous client that cannot be revoked must not stop the new one taking effect. The
+          // pointer has already moved, so nothing reaches the old row; it is a tidiness failure.
+        });
+      }
+
+      await recordAuditEvent(auditStore, {
+        eventType: "mcp.oauth_client_registered",
+        targetType: "mcp_server",
+        targetId: input.serverId,
+        payload: {
+          actor: input.by,
+          server: input.serverId,
+          // The id, never the secret. It identifies the client an administrator registered, which is
+          // what somebody reading the trail needs in order to check it against the vendor's console.
+          clientId: input.client.clientId,
+          replaced: row.credentialId !== null,
+        },
+      });
+    },
+
+    /**
+     * Record that one person connected their own account to one server.
+     *
+     * Upserted on the pair, so reconnecting replaces rather than accumulating. The credential the row
+     * used to point at is revoked in the same breath: a refresh token nothing points at is still a
+     * live grant at the vendor, and leaving it behind would mean a person who reconnected had two
+     * valid grants and could only ever see one of them to disconnect it.
+     */
+    async recordConnection(input: {
+      serverId: string;
+      userId: string;
+      refreshToken: string;
+      scope: string;
+    }): Promise<void> {
+      const [previous] = await database
+        .select({ credentialId: mcpUserCredentials.credentialId })
+        .from(mcpUserCredentials)
+        .where(
+          and(
+            eq(mcpUserCredentials.serverId, input.serverId),
+            eq(mcpUserCredentials.userId, input.userId),
+          ),
+        )
+        .limit(1);
+
+      const stored = await credentials.create({
+        kind: "mcp_user_token",
+        provider: input.serverId,
+        keyId: input.userId,
+        metadata: { server: input.serverId, scope: input.scope },
+        encryptedValue: await encryptSecret(encryptionKey, input.refreshToken),
+      });
+
+      await database
+        .insert(mcpUserCredentials)
+        .values({
+          serverId: input.serverId,
+          userId: input.userId,
+          credentialId: stored.id,
+          scope: input.scope,
+        })
+        .onConflictDoUpdate({
+          target: [mcpUserCredentials.serverId, mcpUserCredentials.userId],
+          set: {
+            credentialId: stored.id,
+            scope: input.scope,
+            updatedAt: new Date(),
+          },
+        });
+
+      if (previous) {
+        await credentials.revoke(previous.credentialId).catch(() => {
+          // Same reasoning as above: the pointer has moved, so this is tidiness rather than access.
+        });
+      }
+
+      await recordAuditEvent(auditStore, {
+        eventType: "mcp.account_connected",
+        targetType: "mcp_server",
+        targetId: input.serverId,
+        payload: {
+          actor: input.userId,
+          server: input.serverId,
+          // What the vendor granted, so a later refusal for want of a scope can be explained.
+          scope: input.scope,
+          reconnected: previous !== undefined,
+        },
+      });
+    },
+
+    /**
+     * The deployment's OAuth client for a server, or null if none is registered.
+     *
+     * Decrypted, because both halves are needed: the id to build a consent URL and the secret to
+     * redeem the code it comes back with. Held for the length of one request, like every other
+     * secret this module reads.
+     */
+    async oauthClientFor(serverId: string): Promise<OAuthClient | null> {
+      const [row] = await database
+        .select({ credentialId: mcpServers.credentialId })
+        .from(mcpServers)
+        .where(eq(mcpServers.id, serverId))
+        .limit(1);
+      if (!row?.credentialId) return null;
+
+      try {
+        return JSON.parse(
+          await decryptCredentialForUse(
+            encryptionKey,
+            credentials,
+            row.credentialId,
+          ),
+        ) as OAuthClient;
+      } catch {
+        // A revoked, missing or unreadable client is the same as none for every caller: there is
+        // nothing to send anybody to consent with, and the answer is for an administrator to add one.
+        return null;
+      }
+    },
+
+    /** Which `user-oauth` servers this person has connected, for their own settings page. */
+    async connectionsFor(
+      userId: string,
+    ): Promise<{ serverId: string; scope: string; connectedAt: string }[]> {
+      const rows = await database
+        .select({
+          serverId: mcpUserCredentials.serverId,
+          scope: mcpUserCredentials.scope,
+          connectedAt: mcpUserCredentials.connectedAt,
+        })
+        .from(mcpUserCredentials)
+        .where(eq(mcpUserCredentials.userId, userId))
+        .orderBy(asc(mcpUserCredentials.serverId));
+
+      return rows.map((row) => ({
+        serverId: row.serverId,
+        scope: row.scope,
+        connectedAt: iso(row.connectedAt) ?? "",
+      }));
+    },
+
+    /**
+     * Retire every connector credential belonging to one person.
+     *
+     * WHAT THIS IS FOR. "We removed their access" has to be true of the thing that matters, which is
+     * the refresh token sitting at the vendor. Removing somebody from the People screen used to end
+     * their sessions and add them to the deny list, and leave their Google grant entirely intact in
+     * this deployment's vault. They could not exercise it — the actor comes from a session they no
+     * longer get — but the deployment still held a usable secret for a person who had been removed,
+     * which is not what an administrator was told they did, and is the first thing a customer asks
+     * about a per-person connector.
+     *
+     * LOOKED UP IN THE VAULT, NOT THROUGH THE JOIN TABLE. `mcp_user_credentials.user_id` cascades on
+     * a user row being deleted, so by the time somebody is gone the join row can be gone too and the
+     * credential is orphaned: unrevoked, referenced by nothing, reachable from no screen and by no
+     * code path. `credentials.key_id` holds the user id for an `mcp_user_token`, so the vault can
+     * still be asked directly — which makes this work for the person who was removed and for the one
+     * whose row was deleted underneath it.
+     *
+     * The join rows go too, so the account pages stop claiming a connection this deployment can no
+     * longer use.
+     *
+     * NOT vendor-side revocation. That needs the OAuth client and the vendor's revoke endpoint, and
+     * it belongs with disconnect. This is the half that stops us holding the secret; the grant at
+     * Google outlives it until somebody revokes it there. Said plainly rather than implied, because
+     * the difference matters to whoever has to answer for it.
+     */
+    async retireConnectionsFor(
+      userId: string,
+      by: string,
+    ): Promise<{ retired: number }> {
+      if (!userId) return { retired: 0 };
+
+      const owned = await database
+        .select({
+          id: credentialRows.id,
+          provider: credentialRows.provider,
+          revokedAt: credentialRows.revokedAt,
+        })
+        .from(credentialRows)
+        .where(
+          and(
+            eq(credentialRows.kind, "mcp_user_token"),
+            eq(credentialRows.keyId, userId),
+          ),
+        );
+
+      let retired = 0;
+      for (const credential of owned) {
+        // Already revoked is not a failure. Retiring twice is something an administrator can
+        // legitimately do, and the second time should be quiet rather than an error.
+        if (credential.revokedAt) continue;
+        await credentials.revoke(credential.id);
+        retired += 1;
+        await recordAuditEvent(auditStore, {
+          eventType: "mcp.account_disconnected",
+          targetType: "mcp_server",
+          targetId: credential.provider,
+          payload: {
+            actor: by,
+            server: credential.provider,
+            owner: userId,
+            /*
+             * Why, because the two reasons are not the same event to a reader. Somebody disconnecting
+             * their own account is a person changing their mind; an administrator removing somebody
+             * is an offboarding, and an auditor asking "what happened to their access" wants to see
+             * which one this was.
+             */
+            reason: "person_removed",
+            vendorRevoked: false,
+          },
+        });
+      }
+
+      await database
+        .delete(mcpUserCredentials)
+        .where(eq(mcpUserCredentials.userId, userId));
+
+      return { retired };
+    },
+
+    /**
      * May this Bot use this plugin?
      *
      * The single question every caller asks, so there is one place the answer is decided and one
@@ -808,37 +1365,117 @@ export function createPluginStore(options: PluginStoreOptions) {
 
       const verdict = evaluateActionPolicy(options.policy(), context);
 
-      await recordAuditEvent(auditStore, {
-        eventType: verdict.forward ? "mcp.call_succeeded" : "mcp.call_rejected",
-        targetType: "mcp_tool",
-        targetId: input.ref,
-        payload: {
-          actor: input.actorId,
-          bot: input.botId,
-          server: serverId,
-          tool: toolName,
-          effect,
-          decision: {
-            allowed: verdict.allowed,
-            mode: verdict.mode,
-            rule: verdict.matched,
-            source: verdict.source,
-            carriedOut: verdict.forward,
-          },
+      /*
+       * The parts of the row that are known before the attempt, held rather than written.
+       *
+       * Everything here is a fact about the decision, and the decision is final at this point. What
+       * is NOT yet known is whether the call worked, which is why this is a variable and not a write:
+       * the row goes down once, after the outcome exists.
+       */
+      const decided = {
+        actor: input.actorId,
+        bot: input.botId,
+        server: serverId,
+        tool: toolName,
+        effect,
+        /*
+         * Whose credential this call goes out with.
+         *
+         * Without it the trail cannot answer "who did this run reach as", which is the whole question
+         * a per-person connector raises — two rows for the same tool and the same Bot can legitimately
+         * have seen entirely different documents, and nothing else in the row says why.
+         */
+        reachedAs: reachedAsFor(entry, input.actorId),
+        decision: {
+          allowed: verdict.allowed,
+          mode: verdict.mode,
+          rule: verdict.matched,
+          source: verdict.source,
+          carriedOut: verdict.forward,
         },
-      });
+      };
 
+      /*
+       * A refusal is written here, because there is no attempt to wait for.
+       *
+       * This deployment declining is the whole event, and it is recorded before the throw so that a
+       * refusal cannot be lost by the caller's error handling.
+       */
       if (!verdict.forward) {
+        await recordAuditEvent(auditStore, {
+          eventType: "mcp.call_rejected",
+          targetType: "mcp_tool",
+          targetId: input.ref,
+          payload: decided,
+        });
         throw new PluginRefusedError(verdict.reason, verdict.matched);
       }
 
-      const token = await tokenFor(row.credentialId);
-      const result = await callRemoteTool(
-        { url: row.url, token },
-        toolName,
-        args,
-      );
-      return { text: result.text, isError: result.isError };
+      /*
+       * Attempt first, record second.
+       *
+       * The row now says what HAPPENED rather than what was permitted. It used to be written here,
+       * before the two lines below, which meant a call that died at the vendor left `call_succeeded`
+       * behind it — and a per-person connector fails at exactly these two lines: no connection for
+       * the asker, a refresh token the vendor no longer accepts, an API not enabled for the project.
+       * Every one of those was invisible, and worse than invisible, because the trail asserted the
+       * opposite.
+       *
+       * `isError` counts as a failure. A vendor that answers the protocol correctly to say the tool
+       * itself failed has not completed the call, and a reader counting successes should not be told
+       * it did.
+       */
+      try {
+        const { token } = await connectionTokenFor(row, entry, input.actorId);
+        const vendor = injectedVendor ?? transportFor(entry).callTool;
+        const result = await vendor(
+          { url: effectiveUrl(row, entry), token },
+          toolName,
+          args,
+        );
+        await recordAuditEvent(auditStore, {
+          eventType: result.isError ? "mcp.call_failed" : "mcp.call_succeeded",
+          targetType: "mcp_tool",
+          targetId: input.ref,
+          /*
+           * The vendor's own words, when it is reporting a failure.
+           *
+           * Only on the failure branch, and this is the whole point of the distinction. A successful
+           * result is somebody's data — a file listing, a document — and it has no business in an
+           * audit row that an administrator can read. An `isError` result is a message written for
+           * whoever operates this deployment, and it is the most useful sentence available: Google
+           * refuses the Drive MCP server with "The caller does not have permission", which named the
+           * problem after a generic message had already cost a round of probing.
+           *
+           * Capped, because the failure branch is not a promise about length.
+           */
+          payload: result.isError
+            ? {
+                ...decided,
+                failure:
+                  result.text.slice(0, 400) || "the tool reported an error",
+              }
+            : decided,
+        });
+        return { text: result.text, isError: result.isError };
+      } catch (error) {
+        /*
+         * Recorded, then rethrown unchanged. The caller's behaviour is unaffected — what changes is
+         * that the failure now exists in the trail, which is where somebody asking "is this connector
+         * working" looks. The vendor's own sentence is kept, since for a 403 that is the sentence
+         * naming which API is not enabled.
+         */
+        await recordAuditEvent(auditStore, {
+          eventType: "mcp.call_failed",
+          targetType: "mcp_tool",
+          targetId: input.ref,
+          payload: {
+            ...decided,
+            failure: error instanceof Error ? error.message : String(error),
+          },
+        });
+        throw error;
+      }
     },
   };
 }

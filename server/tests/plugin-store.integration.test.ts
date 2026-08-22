@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { createAuditStore } from "../src/audit";
 import type { ActionPolicy } from "../src/computer/policy";
 import { createDatabase } from "../src/db/client";
@@ -32,8 +32,8 @@ const database = createDatabase(
 const suite = randomUUID().slice(0, 8);
 const holderId = `agent_plugin_holder_${suite}`;
 const strangerId = `agent_plugin_stranger_${suite}`;
-const serverId = `atlassian`;
-const toolName = "searchJiraIssues";
+const serverId = "google-drive";
+const toolName = "search_files";
 const ref = `${serverId}/${toolName}`;
 
 let policy: ActionPolicy = { mode: "enforce", deny: [], allow: ["true"] };
@@ -46,6 +46,14 @@ let policy: ActionPolicy = { mode: "enforce", deny: [], allow: ["true"] };
  * configured server, so it is removed only when the test is what created it.
  */
 let serverWasAlreadyConfigured = false;
+/**
+ * Whether this deployment already advertised the tool this suite inserts.
+ *
+ * The vendor really does advertise `search_files`, so the row may be a refreshed fact about the
+ * vendor rather than the suite's fixture. Deleting by name regardless would take a real one; leaving
+ * it always would leave a fixture that reads on screen as a tool the vendor offers.
+ */
+let toolWasAlreadyAdvertised = false;
 
 const store = createPluginStore({
   database,
@@ -53,6 +61,14 @@ const store = createPluginStore({
   credentials: {
     // No credential is ever read in these tests, because every call is refused before the vault.
     readSecret: async () => null,
+    // Nor written. Loud rather than absent: a call reaching either of these would mean this file had
+    // started exercising something it does not claim to, and a silent no-op would hide that.
+    create: async () => {
+      throw new Error("this suite does not write credentials");
+    },
+    revoke: async () => {
+      throw new Error("this suite does not revoke credentials");
+    },
   },
   encryptionKey: "x".repeat(44),
   policy: () => policy,
@@ -94,27 +110,60 @@ beforeAll(async () => {
         .where(eq(mcpServers.id, serverId))
     ).length > 0;
 
+  toolWasAlreadyAdvertised =
+    (
+      await database
+        .select({ name: mcpTools.name })
+        .from(mcpTools)
+        .where(
+          and(eq(mcpTools.serverId, serverId), eq(mcpTools.name, toolName)),
+        )
+    ).length > 0;
+
   // The server row is written directly rather than through addServer, so the test needs no vendor
   // to be reachable. What is under test is the decision, not the listing.
   await database
     .insert(mcpServers)
     .values({
       id: serverId,
-      title: "Atlassian",
-      vendor: "Atlassian",
-      url: "https://mcp.atlassian.com/v1/mcp/authv2",
+      title: "Google Drive",
+      vendor: "Google",
+      url: "https://www.googleapis.com/drive/v3",
       provenance: "first-party",
     })
     .onConflictDoNothing();
   await database
     .insert(mcpTools)
-    .values({ serverId, name: toolName, description: "Search issues." })
+    .values({ serverId, name: toolName, description: "Search files." })
     .onConflictDoNothing();
 });
 
 afterAll(async () => {
-  await database.delete(pluginGrants).where(eq(pluginGrants.ref, ref));
+  /*
+   * Scoped to this suite's own Bots, never to the ref alone.
+   *
+   * `ref` names a REAL server and a real tool — `google-drive/search_files` — so a delete by ref
+   * matches every grant in the deployment, including the ones an administrator made for a Bot people
+   * use. This suite did exactly that once: it ran, and a Bot silently stopped being able to search
+   * Drive, with an audit row showing the grant had been made and nothing showing it removed.
+   *
+   * The primary key is (kind, ref, agent_id). Two of the three are not a row.
+   */
+  await database
+    .delete(pluginGrants)
+    .where(
+      and(
+        eq(pluginGrants.ref, ref),
+        inArray(pluginGrants.agentId, [holderId, strangerId]),
+      ),
+    );
   // A server row is deployment configuration, so it belongs to the deployment rather than here.
+  // The fixture tool goes whether or not this suite owns the server, but only if it put it there.
+  if (!toolWasAlreadyAdvertised) {
+    await database
+      .delete(mcpTools)
+      .where(and(eq(mcpTools.serverId, serverId), eq(mcpTools.name, toolName)));
+  }
   if (!serverWasAlreadyConfigured) {
     await database.delete(mcpTools).where(eq(mcpTools.serverId, serverId));
     await database.delete(mcpServers).where(eq(mcpServers.id, serverId));
@@ -164,7 +213,7 @@ describe("a grant is the permission", () => {
     const held = await store.listForAgent(holderId);
     expect(held.tools.map((tool) => tool.ref)).toEqual([ref]);
     // The name the model is offered, which may not contain a slash.
-    expect(held.tools[0].toolName).toBe("mcp__atlassian__searchJiraIssues");
+    expect(held.tools[0].toolName).toBe("mcp__google-drive__search_files");
 
     const nothing = await store.listForAgent(strangerId);
     expect(nothing.tools).toEqual([]);
@@ -177,7 +226,7 @@ describe("the policy is asked as well as the grant", () => {
     await store.grant("mcp", ref, holderId, "admin@openbot.local");
     policy = {
       mode: "enforce",
-      deny: ['mcp.server == "atlassian"'],
+      deny: ['mcp.server == "google-drive"'],
       allow: ["true"],
     };
 
@@ -198,7 +247,7 @@ describe("the policy is asked as well as the grant", () => {
     expect(thrown).toBeInstanceOf(PluginRefusedError);
     // The rule that decided it, so an operator reading the refusal knows what to edit.
     expect((thrown as PluginRefusedError).rule).toBe(
-      'mcp.server == "atlassian"',
+      'mcp.server == "google-drive"',
     );
 
     const rows = await auditRowsFor(ref);
@@ -206,14 +255,14 @@ describe("the policy is asked as well as the grant", () => {
       (row) =>
         row.eventType === "mcp.call_rejected" &&
         (row.payload as { decision?: { rule?: string } }).decision?.rule ===
-          'mcp.server == "atlassian"',
+          'mcp.server == "google-drive"',
     );
     expect(refusedByPolicy.length).toBeGreaterThan(0);
   });
 
   test("a rule can speak about effect rather than about tool names", async () => {
     await store.grant("mcp", ref, holderId, "admin@openbot.local");
-    // `searchJiraIssues` is advertised and is not in the vendor's write list, so it is a read and
+    // `search_files` is advertised and is not in the vendor's write list, so it is a read and
     // this deny rule must NOT catch it. The assertion is that the call gets past the policy, which
     // it proves by failing at the network instead of as a refusal.
     policy = {
@@ -236,7 +285,55 @@ describe("the policy is asked as well as the grant", () => {
       policy = { mode: "enforce", deny: [], allow: ["true"] };
     }
 
-    expect(thrown).not.toBeInstanceOf(PluginRefusedError);
+    /*
+     * NOT REFUSED BY THE RULE. The call is still refused, because this vendor is reached as the
+     * person asking and nobody has connected — but `rule` is null, which is the assertion: no
+     * expression decided this. Asserting the absence of a refusal outright would only prove the
+     * vendor was unreachable, which was always the weaker claim.
+     */
+    expect(thrown).toBeInstanceOf(PluginRefusedError);
+    expect((thrown as PluginRefusedError).rule).toBeNull();
+    expect((thrown as PluginRefusedError).message).toContain("connected");
+  });
+});
+
+describe("the trail says what happened, not what was permitted", () => {
+  /*
+   * THE REGRESSION THIS EXISTS FOR. `mcp.call_succeeded` used to be written before the credential
+   * was selected and before the network call, so a call that passed the grant and the policy and
+   * then failed left a row asserting it had succeeded — and nothing at all saying it had not.
+   *
+   * That is the worst arrangement available. A trail with a gap makes somebody go and look; a trail
+   * that is confidently wrong is used to rule the connector out and send the search elsewhere. It
+   * did exactly that: a Bot that could not read Drive at all had `call_succeeded` rows behind it.
+   *
+   * `search_files` on `google-drive` is reached as the asker, and nobody here has connected, so this
+   * call is permitted and then cannot be made — which is the shape of failure the row must show.
+   */
+  test("a call that is permitted and then fails is recorded as failed, not as succeeded", async () => {
+    await store.grant("mcp", ref, holderId, "admin@openbot.local");
+    const actorId = `trail_${suite}`;
+
+    await expect(
+      store.callTool({ ref, args: {}, botId: holderId, actorId }),
+    ).rejects.toBeInstanceOf(PluginRefusedError);
+
+    const mine = (await auditRowsFor(ref)).filter(
+      (row) => (row.payload as { actor?: string }).actor === actorId,
+    );
+
+    const failed = mine.filter((row) => row.eventType === "mcp.call_failed");
+    expect(failed.length).toBe(1);
+    // The reason travels with the row. For a 403 this is where the vendor names the API that is not
+    // enabled, which is the sentence that turns a guess into a fix.
+    expect((failed[0].payload as { failure?: string }).failure).toContain(
+      "connected",
+    );
+
+    // The point of the whole test: nothing claims this worked.
+    expect(
+      mine.filter((row) => row.eventType === "mcp.call_succeeded"),
+    ).toEqual([]);
   });
 });
 
@@ -274,8 +371,10 @@ describe("a boundary written about the browser does not refuse tool calls", () =
       policy = { mode: "enforce", deny: [], allow: ["true"] };
     }
 
-    // Not a refusal. It gets as far as the network, which is where this test stops caring.
-    expect(thrown).not.toBeInstanceOf(PluginRefusedError);
+    // The rule did not decide this: `rule` is null. What refuses it is the missing connection for a
+    // vendor reached as the person asking, which is a different sentence and a different cause.
+    expect((thrown as PluginRefusedError).rule).toBeNull();
+    expect((thrown as PluginRefusedError).message).toContain("connected");
   });
 });
 

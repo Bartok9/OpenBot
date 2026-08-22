@@ -25,6 +25,9 @@ function RouteComponent() {
    * The measurements that used to be written out here now live in `PageShell`, which Skills, Admin
    * and this screen all render through. The reason they match is no longer that somebody remembered
    * to copy them.
+   *
+   * Connected accounts used to be a section below. It is its own screen now: a connector can need
+   * more from a person than one switch, and a section cannot grow a page's worth of that.
    */
   return (
     <PageShell

@@ -18,6 +18,39 @@
  * forgery primitive pointed at the deployment's own network.
  */
 
+/**
+ * How a server is authenticated, and whose credential does it.
+ *
+ * The OAuth addresses are pinned here beside the MCP host, for the same reason and with the same
+ * rule: they come from the vendor's published documentation and are never taken from a caller.
+ * These are where this deployment sends a person's authorization code and receives the refresh
+ * token that stands in for their access, so they are a reviewed source contract too.
+ */
+// Type-only, so naming the transport here creates no import cycle with the registry that resolves it.
+import type { TransportKind } from "./transport";
+
+export type CatalogueAuth =
+  /** Answers without any credential at all. */
+  | { kind: "none" }
+  /** One token, held by the deployment, used for everybody. */
+  | { kind: "deployment-bearer" }
+  /**
+   * The asker's own grant. The deployment registers an OAuth client; each person consents once and
+   * the call runs on their token, so the vendor decides what comes back.
+   */
+  | {
+      kind: "user-oauth";
+      authorizationUrl: string;
+      tokenUrl: string;
+      /** Where a disconnect is sent, so revocation happens at the vendor and not just here. */
+      revokeUrl: string;
+      /**
+       * What to ask a person to consent to. Narrow on purpose: a scope granted by everybody who
+       * connects and used by nothing is a permission nobody remembers agreeing to.
+       */
+      scopes: readonly string[];
+    };
+
 export type CatalogueEntry = {
   /** Stable slug. Prefixes every tool name, so tools from two servers can never collide. */
   key: string;
@@ -36,8 +69,20 @@ export type CatalogueEntry = {
   hostPattern?: string;
   /** The path the MCP endpoint is served at. Frozen here, never taken from a caller. */
   path: string;
-  /** True when this server needs a credential from the vault to answer at all. */
-  needsCredential: boolean;
+  /**
+   * Whose credential this server is reached with.
+   *
+   * This used to be `needsCredential: boolean`, which said that a credential was required and not
+   * whose it was. That is the one thing about a connector worth being unambiguous about: a reader
+   * who has to guess guesses the deployment's, and a deployment-wide credential pointed at a
+   * per-person system means everybody's question is answered from what one account can see. So the
+   * shape names it, and every entry states it.
+   *
+   * `deployment-bearer` is a token an administrator holds on behalf of everybody. `user-oauth` is
+   * the person's own grant, where the deployment holds only the OAuth client and each person
+   * consents for themselves.
+   */
+  auth: CatalogueAuth;
   /**
    * The tools this vendor's server exposes that change something.
    *
@@ -47,108 +92,82 @@ export type CatalogueEntry = {
    * than a write classified as a read.
    */
   writeTools: readonly string[];
+  /**
+   * Which protocol reaches this vendor. Absent means MCP, which is what every entry was.
+   *
+   * A field rather than an inference, because the answer is not derivable from the host: Google
+   * serves Drive over both an MCP endpoint and an ordinary REST API, and which one this deployment
+   * uses is a decision about availability and risk rather than a property of the vendor. Naming it
+   * here keeps that decision beside the host it applies to, and makes reversing it a one-line diff.
+   */
+  transport?: TransportKind;
   docsUrl: string;
 };
 
+/**
+ * One entry, deliberately.
+ *
+ * Atlassian, Box, Slack, Salesforce and ServiceNow were here and were removed: each was a reviewed
+ * source contract for a vendor nobody had connected, and a screen offering five untried connectors
+ * asserts more than this deployment can stand behind. They are in the history if they are wanted
+ * back, and re-adding one is a review of that vendor rather than a revert.
+ *
+ * `deployment-bearer` therefore has no entry using it. The shape stays because the call path still
+ * needs it: a server an administrator added by URL has no catalogue entry at all, and that is the
+ * branch it falls into.
+ */
 export const CATALOGUE: readonly CatalogueEntry[] = Object.freeze([
   {
-    key: "atlassian",
-    title: "Atlassian",
-    vendor: "Atlassian",
-    summary: "Jira issues and Confluence pages.",
-    host: "https://mcp.atlassian.com",
-    path: "/v1/mcp/authv2",
-    needsCredential: true,
-    writeTools: Object.freeze([
-      "createJiraIssue",
-      "editJiraIssue",
-      "transitionJiraIssue",
-      "addCommentToJiraIssue",
-      "addWorklogToJiraIssue",
-      "createConfluencePage",
-      "updateConfluencePage",
-      "createConfluenceFooterComment",
-      "createConfluenceInlineComment",
-    ]),
+    key: "google-drive",
+    title: "Google Drive",
+    vendor: "Google",
+    summary: "Files in the Drive of whoever is asking.",
+    /*
+     * Google publishes one MCP server per Workspace product, each on its own host: Gmail, Docs,
+     * Sheets, Slides, Calendar, Chat and People have their own. Drive is here because it is the one
+     * a question about a document needs. Each of the others is a further entry, not a flag on this
+     * one, so adding Gmail stays a reviewed decision about Gmail.
+     */
+    /*
+     * The GA REST API, not `drivemcp.googleapis.com`.
+     *
+     * The MCP server was the original choice and is the better one on paper: vendor-maintained, no
+     * Drive-specific code here at all. It is gated behind the Google Workspace Developer Preview
+     * Program, and an unenrolled project is refused with `The caller does not have permission` —
+     * which describes the project, not the credential, so every check available locally reports a
+     * correct setup. Enrolment is a Workspace-account application with a stated turnaround of days.
+     *
+     * This host has been generally available since 2015. The MCP entry is one line away: set
+     * `transport` back to `mcp` and restore the host and path above. Tool names match Google's MCP
+     * server exactly, so grants survive the swap in either direction.
+     */
+    host: "https://www.googleapis.com",
+    path: "/drive/v3",
+    transport: "google-drive-rest",
+    /*
+     * The first vendor here that cannot be reached with a token an administrator pastes. Google
+     * issues no such token: access is an authorization-code grant belonging to a person. That is
+     * not a limitation to work around, it is the property this connector exists for — two people
+     * asking the same question should get the answers their own accounts can see.
+     */
+    auth: {
+      kind: "user-oauth",
+      authorizationUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+      tokenUrl: "https://oauth2.googleapis.com/token",
+      revokeUrl: "https://oauth2.googleapis.com/revoke",
+      // Read-only, because nothing in this slice writes to anybody's Drive.
+      scopes: Object.freeze(["https://www.googleapis.com/auth/drive.readonly"]),
+    },
+    /*
+     * Named writes even though the scope above makes Google refuse them.
+     *
+     * Belt and braces on purpose. The scope is what stops them; this list is what keeps a boundary
+     * written about writes covering them, so widening the scope later cannot quietly turn a write
+     * into something the policy engine has never heard of.
+     */
+    writeTools: Object.freeze(["create_file", "copy_file"]),
     docsUrl:
-      "https://support.atlassian.com/rovo/docs/getting-started-with-the-atlassian-remote-mcp-server/",
-  },
-  {
-    key: "box",
-    title: "Box",
-    vendor: "Box",
-    summary: "Files and folders in Box.",
-    host: "https://mcp.box.com",
-    path: "/",
-    needsCredential: true,
-    writeTools: Object.freeze([
-      "copy_file",
-      "copy_folder",
-      "create_folder",
-      "create_metadata_template",
-      "get_upload_url",
-      "move_file",
-    ]),
-    docsUrl: "https://developer.box.com/guides/box-mcp/remote/",
-  },
-  {
-    key: "slack",
-    title: "Slack",
-    vendor: "Slack",
-    summary: "Search and post in the channels the credential can reach.",
-    host: "https://mcp.slack.com",
-    path: "/mcp",
-    needsCredential: true,
-    writeTools: Object.freeze([
-      "slack_send_message",
-      "slack_send_message_draft",
-      "slack_schedule_message",
-      "slack_add_reaction",
-      "slack_create_conversation",
-      "slack_create_canvas",
-      "slack_update_canvas",
-    ]),
-    docsUrl: "https://docs.slack.dev/ai/slack-mcp-server/",
-  },
-  {
-    key: "salesforce",
-    title: "Salesforce",
-    vendor: "Salesforce",
-    summary: "Records on the Salesforce platform.",
-    // A shared platform host, which is why the path matters as much as the host here: the frozen
-    // path selects one server and nothing else on that host is reachable through this.
-    host: "https://api.salesforce.com",
-    // Salesforce publishes this server at `/platform/<server>`, with sandbox orgs under
-    // `/sandbox/platform/<server>`. A deployment on a sandbox needs the custom-server form.
-    path: "/platform/mcp/v1/platform/sobject-all",
-    needsCredential: true,
-    writeTools: Object.freeze([
-      "create_record",
-      "update_record",
-      "delete_record",
-    ]),
-    docsUrl:
-      "https://developer.salesforce.com/docs/einstein/genai/guide/mcp.html",
-  },
-  {
-    key: "servicenow",
-    title: "ServiceNow",
-    vendor: "ServiceNow",
-    summary: "Records on your own ServiceNow instance.",
-    // Per-instance: every customer has their own hostname, so there is no single host to pin and
-    // admissibility is an anchored pattern instead. The capture group is the instance label.
-    host: null,
-    hostPattern:
-      "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)\\.service-now\\.com$",
-    path: "/sncapps/mcp-server",
-    needsCredential: true,
-    writeTools: Object.freeze([
-      "create_record",
-      "update_record",
-      "delete_record",
-    ]),
-    docsUrl:
-      "https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/mcp/concept/mcp-server.html",
+      "https://developers.google.com/workspace/guides/configure-mcp-servers",
   },
 ]);
 
