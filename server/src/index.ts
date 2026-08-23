@@ -1,5 +1,6 @@
 import { serve } from "bun";
 import { mintRunAssertion } from "./agents/callback-token";
+import { createAgentFetch } from "./agents/endpoint";
 import { createAgentProfileStore } from "./agents/profile-store";
 import { createRuntimeAgentLoader } from "./agents/runtime-agents";
 import { createApp } from "./app";
@@ -486,6 +487,29 @@ const app = createApp(
             offered: selection.offered.length,
             skills: selection.skills,
           },
+        });
+      },
+    }),
+    // Every run dials the stored endpoint again, so the check that was applied when it was
+    // registered has to be applied to wherever it redirects now.
+    // Absent computer configuration means nothing opted into private hosts, which is the safe
+    // reading and the same one `createApp` takes.
+    createAgentFetch({
+      allowPrivateHosts: config.computer?.allowPrivateHosts === true,
+      // The refusal is what the run already knows; this is what the deployment knows. Written here
+      // rather than in `endpoint.ts` so that file keeps deciding and nothing else, the way the
+      // target check it reuses does.
+      onRefusal: ({ address, reason }) => {
+        void recordAuditEvent(bootAuditStore, {
+          eventType: "agent.dial_refused",
+          targetType: "agent_endpoint",
+          targetId: address,
+          payload: { address, reason },
+        }).catch((error) => {
+          // A trail that cannot be written must not take a refusal down with it: the request is
+          // already refused by the time this runs, and the alternative to a logged failure here is
+          // an unhandled rejection.
+          console.error("Could not record a refused agent dial.", error);
         });
       },
     }),
