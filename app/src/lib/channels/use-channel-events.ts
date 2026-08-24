@@ -1,4 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
+import { useRouter } from "@tanstack/react-router";
 import { useEffect } from "react";
 import { type ChannelPage, type ChannelSummary, channelKeys } from "./queries";
 
@@ -14,6 +15,8 @@ type ChannelActivityEvent = {
   lastMessage: string | null;
   lastMessageAt: string | null;
   lastMessageAgentId: string | null;
+  /** The channel is gone. Absent on an ordinary activity event. */
+  deleted?: true;
 };
 
 const FIRST_RETRY_MS = 500;
@@ -27,6 +30,7 @@ function socketUrl() {
 
 export function useChannelEvents() {
   const queryClient = useQueryClient();
+  const router = useRouter();
 
   useEffect(() => {
     let socket: WebSocket | undefined;
@@ -72,6 +76,24 @@ export function useChannelEvents() {
                 (channel) => channel.id === activity.channelId,
               ),
             );
+
+            // Must run before the patch below, which spreads the event onto the existing row —
+            // reaching that first would stamp `deleted: true` on the row instead of removing it.
+            // An unknown channel here is already gone from this cache, so there is nothing to patch
+            // or invalidate for, unlike the "unknown channel" case below for an ordinary event.
+            if (activity.deleted) {
+              if (holdingPage === -1) return data;
+              const page = data.pages[holdingPage] as ChannelPage;
+              const pages = data.pages.slice();
+              pages[holdingPage] = {
+                ...page,
+                channels: page.channels.filter(
+                  (channel) => channel.id !== activity.channelId,
+                ),
+              };
+              return { ...data, pages };
+            }
+
             // An unknown channel id means the roster is stale; refetch rather than patch.
             if (holdingPage === -1) {
               void queryClient.invalidateQueries({
@@ -103,6 +125,24 @@ export function useChannelEvents() {
             return { ...data, pages };
           },
         );
+
+        /*
+         * A tab looking at the channel somebody just deleted in another tab.
+         *
+         * The tab that issued the delete moves itself before it fires the request. Every other tab
+         * only ever hears about it here, and dropping the row without moving leaves that tab on a
+         * route whose channel no longer resolves: an error, or an empty conversation, depending on
+         * which query answers first.
+         *
+         * Read off the router at event time rather than through `useParams`, so the effect does not
+         * have to be torn down and reconnected on every navigation just to keep this value fresh.
+         */
+        if (activity.deleted) {
+          const { pathname } = router.state.location;
+          if (pathname === `/channel/${activity.channelId}`) {
+            void router.navigate({ to: "/" });
+          }
+        }
       };
 
       // WebSocket needs explicit reconnect handling.
@@ -122,7 +162,7 @@ export function useChannelEvents() {
       if (socket) socket.onclose = null;
       socket?.close();
     };
-  }, [queryClient]);
+  }, [queryClient, router]);
 }
 
 /**
