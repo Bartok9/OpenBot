@@ -8,8 +8,8 @@ import {
   takeControl,
 } from "@/lib/computers/control";
 import { readScreenshot, type Screenshot } from "@/lib/computers/screen";
+import { ChannelAvatar } from "../channels/avatar";
 import { LiveScreen } from "./live-screen";
-import { ComputerPlaceholder } from "./placeholder";
 
 /** Explicit blank-browser URLs use placeholder artwork; missing URL fields are treated as real pages. */
 function isBlankBrowser(shot: Screenshot): boolean {
@@ -45,6 +45,43 @@ const SETTLE_TIMEOUT_MS = 30_000;
 /** Short confirmation window after a secret is sent to the page. */
 const SECRET_CONFIRM_MS = 6_000;
 
+/**
+ * What the frame says when there is no picture in it.
+ *
+ * Shared by the card and the full-size view because it is the same fact at either size, and because
+ * the full-size view is now reachable with nothing to draw: the wheel lives down there, so a person
+ * whose Bot is looking at a blank browser — or whose screen cannot be read at all — has to be able
+ * to open it and be told why it is empty, rather than find a disabled frame and no way in.
+ */
+function NothingToSee({
+  problem,
+  blankBrowser,
+}: {
+  problem: string | null;
+  blankBrowser: boolean;
+}) {
+  return (
+    <span className="absolute inset-0 flex flex-col items-center justify-center gap-1 p-4 text-center text-muted-foreground text-sm">
+      {problem ? (
+        <>
+          <span className="font-medium">
+            You cannot see the screen right now
+          </span>
+          <span>{problem}</span>
+          <span>
+            The assistant may still be working. An administrator can check
+            whether its computer is running.
+          </span>
+        </>
+      ) : blankBrowser ? (
+        <span>The assistant has not opened a page yet.</span>
+      ) : (
+        <span>Waiting for the assistant's screen…</span>
+      )}
+    </span>
+  );
+}
+
 type Props = {
   /** Which computer to watch. One shared computer unless each Bot has been given its own. */
   computerId: string;
@@ -55,6 +92,8 @@ type Props = {
   aspectRatio?: number;
   minWidth?: number;
   minHeight?: number;
+  /** Whose screen this is, drawn as a small badge over the frame. Absent, no badge is drawn. */
+  name?: string;
 };
 
 export function ComputerView({
@@ -64,6 +103,7 @@ export function ComputerView({
   aspectRatio = DEFAULT_ASPECT_RATIO,
   minWidth = DEFAULT_MIN_WIDTH,
   minHeight = DEFAULT_MIN_HEIGHT,
+  name,
 }: Props) {
   const [shot, setShot] = useState<Screenshot | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
@@ -176,19 +216,21 @@ export function ComputerView({
 
   /*
    * Sized from the ratio, never from the payload, so the frame is identical while a screen is
-   * loading and once it arrives.
-   *
-   * A browser that has opened nothing is the exception. Reserving a screen-sized frame for it put a
-   * placeholder the height of a browser window into the middle of a conversation, above an answer
-   * that never involved the browser at all: a Bot asked about Google Drive rendered a full-size
-   * empty panel saying it had not opened a page. Nothing is loading there and nothing is coming, so
-   * there is no layout jump to protect against and no reason to take the room.
+   * loading, once it arrives, and while the browser has nothing open. A blank browser used to
+   * collapse to a strip of text; that made the panel change shape the moment a page opened, and a
+   * surface whose whole job is showing a screen kept surprising the layout around it.
    */
-  const frameStyle = blankBrowser
-    ? { minWidth }
-    : { aspectRatio, minWidth, minHeight };
-  /** Blank browser placeholders should not be opened as readable screens. */
+  const frameStyle = { aspectRatio, minWidth, minHeight };
+  /** Whether there is a page to draw. A blank browser and an unreadable screen are both "no". */
   const showScreen = shot !== null && !blankBrowser;
+  /**
+   * Whether the full-size view has a stream worth opening.
+   *
+   * Nothing to draw, and it says so in the same words the card does — but somebody holding the wheel
+   * gets the live socket whatever is on it, because once a person is driving the stream is the truth
+   * about the page and a placeholder over it would be the view arguing with them.
+   */
+  const showLiveScreen = showScreen || driving;
 
   const polledScreen = showScreen ? (
     <img
@@ -206,47 +248,70 @@ export function ComputerView({
         <button
           type="button"
           onClick={() => setExpanded(true)}
-          // Disabled while blank/waiting but still reserves the frame.
-          disabled={!showScreen}
-          className="relative block w-full bg-muted enabled:cursor-zoom-in"
+          /*
+           * Opens whether or not there is a picture in it. It used to be disabled without one, and
+           * the wheel is down there: a blank browser, a screen that had not arrived yet, or a
+           * computer that could not be reached left a person with no way to take control at all —
+           * the states where they most want it. With nothing to draw the full-size view shows these
+           * same words, and the wheel below them.
+           */
+          className="relative block w-full cursor-pointer bg-muted"
           style={frameStyle}
           aria-label="Open the assistant's screen full size"
         >
           {polledScreen}
 
-          {blankBrowser ? (
-            <ComputerPlaceholder className="absolute inset-0 h-full w-full" />
+          {/* Whose computer this is — and whose hands are on it — said on the picture itself. */}
+          {name || driving ? (
+            <span className="absolute right-2 bottom-2 flex items-center gap-1.5">
+              {name ? (
+                <span className="flex items-center gap-1.5 rounded-full bg-black/60 py-1 pr-2.5 pl-1.5 font-medium text-white text-xs backdrop-blur-sm">
+                  <ChannelAvatar participantIds={[computerId]} size={16} />
+                  {name}
+                </span>
+              ) : null}
+              {driving ? (
+                <span className="rounded-full bg-white px-2.5 py-1 font-medium text-black text-xs shadow-sm">
+                  You have control
+                </span>
+              ) : null}
+            </span>
           ) : null}
-          {/* The blank state is a line of text, so it needs its own height rather than the frame's. */}
-          {blankBrowser ? <span className="block py-6" /> : null}
 
           {showScreen ? null : (
-            <span
-              className={`absolute inset-0 flex flex-col items-center justify-center gap-1 p-4 text-center text-sm ${
-                blankBrowser
-                  ? "bg-black/25 text-white"
-                  : "text-muted-foreground"
-              }`}
-            >
-              {problem ? (
-                <>
-                  <span className="font-medium">
-                    You cannot see the screen right now
-                  </span>
-                  <span>{problem}</span>
-                  <span className={blankBrowser ? "text-white/80" : undefined}>
-                    The assistant may still be working. An administrator can
-                    check whether its computer is running.
-                  </span>
-                </>
-              ) : blankBrowser ? (
-                <span>The assistant has not opened a page yet.</span>
-              ) : (
-                <span>Waiting for the assistant's screen…</span>
-              )}
-            </span>
+            <NothingToSee blankBrowser={blankBrowser} problem={problem} />
           )}
         </button>
+
+        {/*
+         * The Bot ASKING for the wheel, which is not the same thing as a person wanting it.
+         *
+         * The standing "who is driving" prose and the everyday Take control button live in the
+         * full-size view, where there is a page big enough to drive. This row is the exception: a
+         * request is an exceptional state with a reason attached, it is the one moment the screen is
+         * waiting on a person rather than the other way round, and making them open the full-size
+         * view to find out what was wanted would hide the reason behind a click. Taking the wheel
+         * from here opens that view, because driving is what they are being asked to do.
+         */}
+        {!driving && control?.requested ? (
+          <div className="flex items-start justify-between gap-3 border-t bg-amber-500/10 px-3 py-2 text-sm">
+            <span>
+              <strong className="font-medium">The assistant needs you.</strong>{" "}
+              {control.reason}
+            </span>
+            <button
+              type="button"
+              onClick={async () => {
+                const state = await takeControl(computerId);
+                if (state) setControl(state);
+                setExpanded(true);
+              }}
+              className="shrink-0 rounded-md bg-primary px-3 py-1 font-medium text-primary-foreground text-xs"
+            >
+              Take control
+            </button>
+          </div>
+        ) : null}
 
         {/*
           Secret values go directly to the page path and are never included in the conversation.
@@ -303,77 +368,12 @@ export function ComputerView({
           </form>
         ) : null}
 
-        {driving ? (
-          <div className="flex items-center justify-between gap-3 border-t bg-muted/40 px-3 py-2 text-sm">
-            <span>You have control of this browser.</span>
-            <span className="flex shrink-0 gap-2">
-              <button
-                type="button"
-                onClick={() => setExpanded(true)}
-                className="rounded-md border px-3 py-1 text-xs font-medium"
-              >
-                Open full size
-              </button>
-              <button
-                type="button"
-                onClick={() => void handBack()}
-                className="rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground"
-              >
-                Hand back
-              </button>
-            </span>
-          </div>
-        ) : null}
-
         {/*
-         * The wheel is offered whether or not the Bot asked for it.
-         *
-         * It only used to appear once the Bot called `computer_request_help`, which made the button
-         * depend on the Bot getting one instruction right. It does not always: asked to open a page
-         * behind a sign-in, a Bot answered "If you'd like, I can prompt you to take control … would
-         * you like to proceed with signing in?" and called nothing. The person was told to take
-         * control, and there was no control to take. The prompt already forbids that sentence in as
-         * many words, so the answer is not more prose: it is that a person who wants their own
-         * browser should not have to be offered it first.
-         *
-         * The amber row stays the Bot ASKING, which is a different thing and still worth its own
-         * colour and its reason. Without a request this is a quiet control that says who is driving.
+         * The inline card carries no persistent footer: taking the wheel, handing it back, and the
+         * standing "who is driving" prose all live in the full-size view, where there is a page big
+         * enough to drive. The two rows above appear only while the Bot is stuck — waiting on a
+         * credential, or asking for the wheel — and go again when it is not.
          */}
-        {!driving ? (
-          <div
-            className={`flex items-start justify-between gap-3 border-t px-3 py-2 text-sm ${
-              control?.requested ? "bg-amber-500/10" : "bg-muted/40"
-            }`}
-          >
-            <span>
-              {control?.requested ? (
-                <>
-                  <strong className="font-medium">
-                    The assistant needs you.
-                  </strong>{" "}
-                  {control.reason}
-                </>
-              ) : (
-                "The assistant is driving. You can take over whenever you want."
-              )}
-            </span>
-            <button
-              type="button"
-              onClick={async () => {
-                const state = await takeControl(computerId);
-                if (state) setControl(state);
-                setExpanded(true);
-              }}
-              className={`shrink-0 rounded-md px-3 py-1 text-xs font-medium ${
-                control?.requested
-                  ? "bg-primary text-primary-foreground"
-                  : "border"
-              }`}
-            >
-              Take control
-            </button>
-          </div>
-        ) : null}
       </figure>
 
       {/*
@@ -385,7 +385,7 @@ export function ComputerView({
               role="dialog"
               aria-modal="true"
               aria-label="The assistant's screen"
-              className="fixed inset-0 z-50 flex flex-col p-4 sm:p-8"
+              className="fixed inset-0 z-50 flex flex-col items-center justify-center p-4 sm:p-8"
             >
               {/* Backdrop closes only while read-only; during driving, Escape remains the exit. */}
               <button
@@ -396,57 +396,77 @@ export function ComputerView({
                 tabIndex={driving ? -1 : 0}
                 className={`absolute inset-0 bg-black/80 ${driving ? "cursor-default" : "cursor-zoom-out"}`}
               />
-              <div className="relative mb-3 flex items-center justify-between gap-4 text-sm text-white">
-                <span className="pointer-events-none">
-                  {driving ? (
-                    <>
-                      <strong className="font-medium">You have control.</strong>{" "}
-                      Click and type on the page as you normally would.
-                      {control?.reason ? ` ${control.reason}` : null}
-                    </>
+              {/* A card holding the screen, with who and the wheel centered beneath it. */}
+              <div className="relative flex w-full max-w-[70vw] min-w-0 flex-col rounded-2xl bg-background p-4 shadow-2xl">
+                {/*
+                  Overlay uses the live socket; the inline card keeps low-cost polling. With no page
+                  to draw it reserves the same frame and says the same thing the card does — the
+                  wheel below is the reason this view opens at all in that state.
+                */}
+                <div
+                  className={`relative max-h-[75vh] min-h-0 overflow-auto rounded-xl ${showLiveScreen ? "bg-black" : "bg-muted"}`}
+                >
+                  {showLiveScreen ? (
+                    <LiveScreen
+                      computerId={computerId}
+                      driving={driving}
+                      onProblem={setProblem}
+                    />
                   ) : (
-                    <>The assistant's screen{active ? ", updating live" : ""}</>
+                    <div className="relative w-full" style={{ aspectRatio }}>
+                      <NothingToSee
+                        blankBrowser={blankBrowser}
+                        problem={problem}
+                      />
+                    </div>
                   )}
-                </span>
-                <span className="flex shrink-0 items-center gap-3">
+                </div>
+                <div className="mt-4 flex items-center justify-center gap-4">
+                  <span className="flex min-w-0 items-center gap-2 text-sm">
+                    {name ? (
+                      <span className="flex shrink-0 items-center gap-1.5 font-medium">
+                        <ChannelAvatar
+                          participantIds={[computerId]}
+                          size={20}
+                        />
+                        {name}
+                      </span>
+                    ) : null}
+                    {driving ? (
+                      <span className="truncate text-muted-foreground">
+                        You have control — click and type on the page.
+                        {control?.reason ? ` ${control.reason}` : null}
+                      </span>
+                    ) : control?.requested ? (
+                      <span className="truncate text-muted-foreground">
+                        <strong className="font-medium text-foreground">
+                          The assistant needs you.
+                        </strong>{" "}
+                        {control.reason}
+                      </span>
+                    ) : null}
+                  </span>
                   {driving ? (
                     <button
                       type="button"
-                      onClick={() => {
-                        setExpanded(false);
-                        void handBack();
-                      }}
-                      className="rounded-md bg-white px-3 py-1 text-xs font-medium text-black"
+                      onClick={() => void handBack()}
+                      className="shrink-0 rounded-md bg-primary px-3 py-1.5 font-medium text-primary-foreground text-sm"
                     >
-                      Hand back to the assistant
+                      Hand back
                     </button>
                   ) : (
-                    /* Offered here too, and for the same reason: see the inline card above. */
                     <button
                       type="button"
                       onClick={async () => {
                         const state = await takeControl(computerId);
                         if (state) setControl(state);
                       }}
-                      className="rounded-md bg-white px-3 py-1 text-xs font-medium text-black"
+                      className="shrink-0 rounded-md border px-3 py-1.5 font-medium text-sm"
                     >
                       Take control
                     </button>
                   )}
-                  <span className="pointer-events-none text-white/70">
-                    {driving
-                      ? "Press Escape to close"
-                      : "Click anywhere or press Escape to close"}
-                  </span>
-                </span>
-              </div>
-              {/* Overlay uses the live socket; the inline card keeps low-cost polling. */}
-              <div className="relative min-h-0 flex-1 overflow-auto rounded-lg bg-black">
-                <LiveScreen
-                  computerId={computerId}
-                  driving={driving}
-                  onProblem={setProblem}
-                />
+                </div>
               </div>
             </div>,
             document.body,
