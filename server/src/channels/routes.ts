@@ -51,6 +51,8 @@ export type ChannelSummary = AgentChannel & {
   createdAt: Date;
   /** Whether the caller pinned this channel. A pin is per-member, so this is the caller's, only. */
   pinned: boolean;
+  /** When the caller last had this channel open, or null for never. The caller's, only. */
+  lastReadAt: Date | null;
 };
 
 /** What a client that ran an agent reports back about the message it just saw. */
@@ -152,6 +154,8 @@ export type ChannelStore = {
     channelId: string,
     pinned: boolean,
   ): Promise<void>;
+  /** Stamp the caller's own membership as read now. Throws ChannelNotFoundError for a non-member. */
+  markRead(actor: AgentActor, channelId: string): Promise<void>;
   /**
    * Hide the channel for every member. Soft: the row and the thread survive, every read filters.
    * Throws ChannelNotFoundError for a non-member and ChannelPackageOwnedError for a channel the
@@ -366,6 +370,7 @@ export function createChannelStore(
           lastMessageAgentId: channels.lastMessageAgentId,
           createdAt: channels.createdAt,
           pinnedAt: channelMemberships.pinnedAt,
+          lastReadAt: channelMemberships.lastReadAt,
         })
         .from(channels)
         .innerJoin(
@@ -423,6 +428,7 @@ export function createChannelStore(
           lastMessageAgentId: row.lastMessageAgentId,
           createdAt: row.createdAt,
           pinned: row.pinnedAt !== null,
+          lastReadAt: row.lastReadAt,
         });
       }
       return { channels: [...summaries.values()], nextCursor };
@@ -480,6 +486,39 @@ export function createChannelStore(
         },
         { isolationLevel: "read committed" },
       );
+    },
+
+    async markRead(actor, channelId) {
+      const updated = await database
+        .update(channelMemberships)
+        .set({
+          /*
+           * The later of this clock and the channel's own last-message stamp. last_message_at is
+           * written from the reporting browser's clock and is not bounded; a marker stamped
+           * plainly "now" by a server running behind it would leave the row reading as unseen for
+           * every member, re-lighting the dot on each refetch until wall clock catches up.
+           */
+          lastReadAt: sql`greatest(now(), coalesce((select ${channels.lastMessageAt} from ${channels} where ${channels.id} = ${channelMemberships.channelId}), now()))`,
+        })
+        .where(
+          and(
+            eq(channelMemberships.channelId, channelId),
+            eq(channelMemberships.userId, actor.id),
+            // A deleted channel is not there to read. The same guard `setPinned` carries, for the
+            // same reason: the row is gone from every roster, so nothing about it is markable.
+            exists(
+              database
+                .select({ one: sql`1` })
+                .from(channels)
+                .where(
+                  and(eq(channels.id, channelId), isNull(channels.deletedAt)),
+                ),
+            ),
+          ),
+        )
+        .returning({ channelId: channelMemberships.channelId });
+      // Not a member, or no such channel: the same answer either way, matching setPinned.
+      if (updated.length === 0) throw new ChannelNotFoundError(channelId);
     },
 
     async softDelete(actor, channelId) {
@@ -874,6 +913,15 @@ export function createChannelRoutes(
     }
   });
 
+  routes.put("/:channelId/read", requireUser, async (context) => {
+    try {
+      await store.markRead(context.var.actor, context.req.param("channelId"));
+      return context.body(null, 204);
+    } catch (error) {
+      return mapStoreError(context, error);
+    }
+  });
+
   routes.delete("/:channelId", requireUser, async (context) => {
     const channelId = context.req.param("channelId");
     try {
@@ -922,6 +970,8 @@ function channelSummaryDto(channel: ChannelSummary) {
     lastMessageAgentId: channel.lastMessageAgentId,
     createdAt: channel.createdAt.toISOString(),
     pinned: channel.pinned,
+    // Serialised as ISO-8601 like lastMessageAt, so the browser can compare the two as strings.
+    lastReadAt: channel.lastReadAt?.toISOString() ?? null,
   };
 }
 

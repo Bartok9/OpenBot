@@ -79,6 +79,9 @@ function fakeStore(
     async setPinned(receivedActor, id, pinned) {
       calls.push(["setPinned", receivedActor, id, pinned]);
     },
+    async markRead(receivedActor, id) {
+      calls.push(["markRead", receivedActor, id]);
+    },
     async softDelete(receivedActor, id) {
       calls.push(["softDelete", receivedActor, id]);
     },
@@ -355,6 +358,45 @@ describe("channel routes", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ pinned: true }),
     });
+
+    expect(response.status).toBe(401);
+    expect(store.calls).toEqual([]);
+  });
+
+  test("marks read through the authenticated actor and answers 204", async () => {
+    const store = fakeStore();
+    const response = await appFor(store).request(
+      "http://openbot.test/channel-1/read",
+      { method: "PUT" },
+    );
+
+    expect(response.status).toBe(204);
+    expect(store.calls).toEqual([["markRead", actor, "channel-1"]]);
+  });
+
+  test("maps an unknown channel to 404 for marking read", async () => {
+    const store = fakeStore({
+      markRead: async () => {
+        throw new ChannelNotFoundError("channel-1");
+      },
+    });
+    const response = await appFor(store).request(
+      "http://openbot.test/channel-1/read",
+      { method: "PUT" },
+    );
+
+    expect(response.status).toBe(404);
+    expect(await json(response)).toEqual({ error: "Channel not found." });
+  });
+
+  test("keeps authentication in front of marking read", async () => {
+    const store = fakeStore();
+    const denied: MiddlewareHandler<{ Variables: AppVariables }> = (context) =>
+      Promise.resolve(context.json({ error: "denied" }, 401));
+    const response = await appFor(store, denied).request(
+      "http://openbot.test/channel-1/read",
+      { method: "PUT" },
+    );
 
     expect(response.status).toBe(401);
     expect(store.calls).toEqual([]);
@@ -1112,6 +1154,127 @@ describe("channel pinning", () => {
         (channel) => channel.id === created.id,
       )?.pinned,
     ).toBe(false);
+  });
+});
+
+describe("channel read markers", () => {
+  // Two members of one channel, which is what a per-member marker has to be tested against.
+  async function sharedChannel() {
+    const reader = await createPersistentUser();
+    const other = await createPersistentUser();
+    const agentId = await createPersistentAgent({
+      name: "Shared readable agent",
+      owner: reader,
+      visibility: "public",
+    });
+    const created = await persistentStore.create(reader, [agentId]);
+    createdChannelIds.push(created.id);
+    // The store only creates the creator's membership; give the other user one directly,
+    // plus the thread mapping the list join requires.
+    await database.insert(channelMemberships).values({
+      channelId: created.id,
+      userId: other.id,
+    });
+    await database.insert(intelligenceChannelMappings).values({
+      userId: other.id,
+      channelId: created.id,
+      // thread_id is globally unique; the reader's own mapping row already claimed
+      // created.threadId, so the other member's row needs one of its own.
+      threadId: randomUUID(),
+    });
+    return { reader, other, channelId: created.id };
+  }
+
+  test("stamps last_read_at on the caller's own membership only", async () => {
+    const { reader, other, channelId } = await sharedChannel();
+
+    await persistentStore.markRead(reader, channelId);
+
+    const rows = await database
+      .select({
+        userId: channelMemberships.userId,
+        lastReadAt: channelMemberships.lastReadAt,
+      })
+      .from(channelMemberships)
+      .where(eq(channelMemberships.channelId, channelId));
+    expect(
+      rows.find((row) => row.userId === reader.id)?.lastReadAt,
+    ).not.toBeNull();
+    expect(rows.find((row) => row.userId === other.id)?.lastReadAt).toBeNull();
+  });
+
+  test("the list carries the caller's lastReadAt and nobody else's", async () => {
+    const { reader, other, channelId } = await sharedChannel();
+
+    await persistentStore.markRead(reader, channelId);
+
+    const forReader = await persistentStore.list(reader);
+    const forOther = await persistentStore.list(other);
+    expect(
+      forReader.channels.find((channel) => channel.id === channelId)
+        ?.lastReadAt,
+    ).not.toBeNull();
+    expect(
+      forOther.channels.find((channel) => channel.id === channelId)?.lastReadAt,
+    ).toBeNull();
+  });
+
+  test("refuses to mark read a channel the caller is not a member of", async () => {
+    const { channelId } = await sharedChannel();
+    const outsider = await createPersistentUser();
+
+    await expect(
+      persistentStore.markRead(outsider, channelId),
+    ).rejects.toBeInstanceOf(ChannelNotFoundError);
+  });
+
+  test("stamps a read no earlier than the channel's own last-message clock", async () => {
+    const { reader, channelId } = await sharedChannel();
+    // last_message_at is written from the reporting browser's clock and is not bounded; simulate
+    // one running ahead of the server so a plain "now" stamp would still read as unseen.
+    const future = new Date(Date.now() + 60_000);
+    await database
+      .update(channels)
+      .set({ lastMessageAt: future })
+      .where(eq(channels.id, channelId));
+
+    await persistentStore.markRead(reader, channelId);
+
+    const [row] = await database
+      .select({ lastReadAt: channelMemberships.lastReadAt })
+      .from(channelMemberships)
+      .where(
+        and(
+          eq(channelMemberships.channelId, channelId),
+          eq(channelMemberships.userId, reader.id),
+        ),
+      );
+    expect(row?.lastReadAt).not.toBeNull();
+    expect(row?.lastReadAt?.getTime() ?? 0).toBeGreaterThanOrEqual(
+      future.getTime(),
+    );
+  });
+
+  test("refuses to mark a soft-deleted channel read, mirroring setPinned", async () => {
+    const { reader, channelId } = await sharedChannel();
+
+    await persistentStore.softDelete(reader, channelId);
+
+    await expect(
+      persistentStore.markRead(reader, channelId),
+    ).rejects.toBeInstanceOf(ChannelNotFoundError);
+
+    const [row] = await database
+      .select({ lastReadAt: channelMemberships.lastReadAt })
+      .from(channelMemberships)
+      .where(
+        and(
+          eq(channelMemberships.channelId, channelId),
+          eq(channelMemberships.userId, reader.id),
+        ),
+      );
+    // The membership row outlives the channel, but its marker was never stamped.
+    expect(row?.lastReadAt).toBeNull();
   });
 });
 
