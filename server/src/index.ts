@@ -22,6 +22,7 @@ import { createThreadIdentity } from "./channels/thread-identity";
 import { createSandboxedStore } from "./components/sandboxed";
 import { createComponentStore } from "./components/store";
 import { createComputerGateway } from "./computer/gateway";
+import { createPageFrameStore } from "./computer/page-frames";
 import { startPolicyListener } from "./computer/policy-listener";
 import {
   createPolicyStore,
@@ -254,6 +255,9 @@ const computerGateway = computerProvider
       // when the snapshot was taken by another server. A Map here would be blank on every replica
       // but the one that snapshotted, and the boundary would decide with no element to look at.
       snapshots: createSnapshotStore(database),
+      // So wiping a profile takes the pictures of its signed-in pages with it, which is what the
+      // sentence on that button already promised.
+      pageFrames: createPageFrameStore(database),
       allowPrivateHosts: config.computer?.allowPrivateHosts,
       token: config.computer?.token,
     })
@@ -551,6 +555,8 @@ const app = createApp(
   identityProviderStore,
   // Chooses the coworker for an untagged message, on the deployment's own model and key.
   intentRouter,
+  // What a browsing turn's screen looked like when it finished, so the transcript can show it later.
+  createPageFrameStore(database),
 );
 
 /**

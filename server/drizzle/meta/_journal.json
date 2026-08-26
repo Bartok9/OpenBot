@@ -120,6 +120,20 @@
       "when": 1787581516968,
       "tag": "0016_pin_and_soft_delete_channels",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1787684818682,
+      "tag": "0017_durable_work",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1787688017645,
+      "tag": "0018_page_frames",
+      "breakpoints": true
     }
   ]
 }

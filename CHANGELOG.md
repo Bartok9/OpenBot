@@ -8,6 +8,134 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
+### A finished turn shows the page it opened, not the one open now
+
+Reopening a conversation made every past turn fetch the screen as it is now, so an answer about
+Hacker News from an hour ago sat under a picture of whatever the Bot had open since.
+
+A page is now photographed where it is opened. The server takes the frame the moment a navigation
+succeeds and keeps it in `computer_page_frame` under the computer and the address, which is the one
+moment the screen is certainly showing the page that was asked for. Reopening the conversation shows
+that frame rather than the live screen, and a turn with nothing kept names the page instead of
+drawing the wrong one.
+
+The surface used to capture it itself once the turn went quiet, and that is a race it cannot win: a
+reopened turn and one that has just finished are indistinguishable from inside the component, the
+same computer is driven by other conversations in between, and a resumed computer starts blank. It
+filed pictures of pages the turn never opened, or none at all. It only reads now.
+
+**Redeploy the computers with the server.** A screenshot only says which page it is of on an
+`agent-computer` built after that field was added, and this is what decides whether a frame is kept.
+Where each Bot has a computer of its own there is nobody to race with, so an old computer's picture is
+accepted and the feature works through a rollout. On ONE SHARED COMPUTER it cannot be: another Bot's
+navigation lands between the navigation and the picture, and a frame that cannot be told apart from
+theirs is refused. So a shared-computer deployment that updates the server and not the computer keeps
+no frames until it does, and says so in the server log each time rather than leaving somebody to
+wonder.
+
+Two things followed from making a past turn a record. Its placeholder is decided by the turn being
+over rather than by whether a live frame happens to be in hand, because a tile that was live a moment
+ago keeps its last screenshot and used to fall through to "Waiting for the assistant's screen…" and
+wait there for ever. And opening one full size shows that same kept frame, with no live stream and no
+wheel: zooming a past turn used to mount the socket and offer Take control, so the one gesture for
+looking closer at what a turn did replaced it with whatever the Bot has open now.
+
+### A conversation keeps the browsing that produced its answers
+
+Every turn in which a Bot used a tool was disappearing from the transcript on reload. The sentence
+the Bot wrote stayed; the browsing that produced it did not, the inline screen went with it, and the
+footer said some messages could not be read.
+
+The history store writes a tool call as `{id, name, args}`. AG-UI describes
+`{id, type: "function", function: {name, arguments}}`. The reader validated against the second,
+treated the first as damage from an interrupted run, and dropped it. It is not damage: it is how
+every tool call is stored, so what looked like a guard against one bad turn was deleting all of the
+real ones. Observed on a live thread where every browsing turn was counted unreadable and every one
+of them was well formed in the store's own dialect.
+
+The two spellings are now read as the same thing. The check stays for turns that really are
+malformed, and a mixed or unrecognised array is still refused rather than half-translated, because a
+reader that rewrites what it does not recognise is worse than one that refuses it.
+
+
+### Run this on Kubernetes
+
+A Helm chart under `charts/openbot`, Bots and all, and the fixes that installing it for real turned
+up. Proven on a real EKS cluster: five workloads, replicas across two nodes, EBS volumes bound, and a
+Bot opening a real page from inside AWS with the decision in the audit trail.
+
+One chart, four targets: EKS, GKE, AKS and somebody's own cluster, with nothing but values between
+them. There is no cloud branching in any template. Every place the clouds genuinely differ is a
+value whose default is what a plain self-hosted cluster does: the cluster's own default StorageClass,
+no RuntimeClass, a plain Kubernetes Secret, an Ingress. Identity is one `serviceAccount.annotations`
+map, which is all IRSA, Workload Identity and AKS workload identity are. Secrets are a plain Secret
+by default and an ExternalSecret against any backend when asked, so Secrets Manager, Secret Manager
+and Key Vault are a values block rather than three code paths. Gateway API is supported beside
+Ingress rather than instead of it. `charts/openbot/ci` holds a values file per target.
+
+Two replicas by default, because horizontal is the point and one replica hides every bug that is
+not. A bad install is refused at `helm install`, naming the value to change, rather than discovered
+in a crash loop: no database or two of them, nobody who could sign in, nobody who would be an
+administrator, a key of the wrong shape, both routers enabled, or a browser asked for inside more
+than one replica.
+
+**A Bot's computer is not in an API pod.** The image runs one beside the API so that a single
+container works on its own, and `EMBEDDED_COMPUTER=off` turns it off. A replica must not carry a
+browser: it is a few hundred megabytes holding one Bot's logins, so scaling the API would scale
+those with it.
+
+**Migrations no longer need a development tool.** `bun x drizzle-kit migrate` cannot run in the
+shipped image at all. The CLI reads a TypeScript config, which needs the esbuild that
+`bun install --production` correctly leaves out, so it printed "Reading config file", exited 1 and
+said nothing else. `EMBEDDED_POSTGRES=on` was therefore starting a container whose database was
+never migrated, and the first symptom was the API reporting that `users` does not exist.
+`server/scripts/migrate.ts` uses the migrator inside `drizzle-orm`, which is a runtime dependency
+already, and keeps the same journal, so a database migrated by either tool is migrated.
+
+**A computer for each Bot, suspended when idle.** `computers.mode: sandbox` gives every Bot its own
+browser as a `Sandbox` from `kubernetes-sigs/agent-sandbox`, which is built for this workload: an
+isolated, stateful, singleton pod with a stable identity and persistent storage. Suspending is one
+field, and it keeps the volumes, so a computer comes back with its logins rather than signed out of
+everything. `shared` stays the default and needs nothing installed in the cluster.
+
+**The NetworkPolicy would have fenced the API off from its own work.** Its egress named DNS and the
+bundled database and nothing else, so on a cluster that enforces policy the API could not have
+reached a Bot's computer or, with a managed database, the database. Both are allowed now, and turning
+the policy on with an external database and no rule for it is refused rather than shipped. Worth
+knowing either way: EKS runs its CNI with `--enable-network-policy=false`, so a policy there installs,
+looks right, and does nothing at all.
+
+**A cluster with no controller is refused at install.** `computers.mode: sandbox` needs the
+agent-sandbox CRD, and without it the install succeeds, every pod is healthy, and the deployment
+looks finished until the first Bot asks for a browser. The chart reads the cluster and refuses,
+naming the one command that fixes it.
+
+**What decides a computer is idle is the audit trail, not the browser.** Asking the browser would
+wake it, so every computer anything asked about would come back up and the bill would never fall.
+
+**Durable work, claimed by whichever replica gets there first.** `work_items` plus
+`select ... for update skip locked` and a lease: no coordinator, no leader election, and a replica
+added is throughput added. The idle-computer culler is its first user; scheduled routines and
+hand-offs between Bots are the other two, which is why it is written once rather than three times
+slightly differently. A CronJob runs the sweep, because a timer in the API fires in every replica and
+suspending a browser somebody just started using is not something to do five times.
+
+**Which run of a computer this is, across a suspend.** A resumed browser counts snapshot
+generations from one again, so a ref the model still holds from before the suspend would match a row
+nothing has overwritten and the boundary would decide about an element on a page that no longer
+exists. The first answer here used the node and the pod address, and resuming a real computer
+disproved it: a suspended sandbox is very often rescheduled onto the same node and handed the same
+address back, so both were identical across a suspend and resume and the check would have said "same
+run" for the exact case it exists to catch. It reads the `Ready` condition's transition time instead,
+which moves every time a computer starts serving again.
+
+**Which run of a computer this is, on more than one replica.** `sessionOf` answered from a map in
+the process that started the computer, which is right until there are two: the replica that took a
+snapshot is usually not the one handling the click, and the second had nothing to answer with. An
+unknown session means "no opinion" and skips the generation check, so on exactly the deployment
+shape it was written for, the check that stops a ref from a replaced computer resolving against a
+live one was silently absent. It now asks the supervisor when it does not know, by listing rather
+than by ensuring, so asking never starts a computer that had stopped.
 ### Notion joins the connector catalogue
 
 Notion is now a governed MCP connector, reached through Notion's own hosted server on the
@@ -35,7 +163,6 @@ read that as a stolen token and revoke the whole connection. Every plugin call t
 token now locks the credential's vault row for the length of the exchange, so a second replica waits
 rather than races, and the rotated token is written back in the same transaction that held the lock.
 Nothing to configure; a connection just stops going stale under concurrent traffic.
-
 ### Knowledge searches instead of guessing
 
 A package can say which of its skills each coworker gets, and the fintech example gives Knowledge the
