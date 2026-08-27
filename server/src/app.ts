@@ -30,9 +30,9 @@ import type { SandboxedStore } from "./components/sandboxed";
 import { createSandboxedRoutes } from "./components/sandboxed-routes";
 import type { ComponentStore } from "./components/store";
 import type { ComputerGateway } from "./computer/gateway";
+import type { PageFrameStore } from "./computer/page-frames";
 import type { PolicyStore } from "./computer/policy-store";
 import { createComputerRoutes } from "./computer/routes";
-import type { PageFrameStore } from "./computer/page-frames";
 import { configuredAuthProviders, type DeploymentConfig } from "./config";
 import type { CredentialAdminService, CredentialInput } from "./credentials";
 import { createIntelligenceClient } from "./intelligence-client";
@@ -40,10 +40,10 @@ import type { PeopleStore } from "./people/store";
 import { createPluginRoutes } from "./plugins/routes";
 import type { PluginStore } from "./plugins/store";
 import { REFUSAL_MARKER } from "./plugins/tools";
+import { createRoutineRoutes, type RoutineStore } from "./routines/routes";
+import type { RoutineRunner } from "./routines/runner";
 import type { IntentRouter } from "./routing/classify";
 import { createRoutingRoutes } from "./routing/routes";
-import type { RoutineRunner } from "./routines/runner";
-import { createRoutineRoutes, type RoutineStore } from "./routines/routes";
 import type { PackageStatusReader } from "./tenant-package";
 
 /**
