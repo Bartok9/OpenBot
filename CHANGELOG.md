@@ -8,6 +8,14 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
+### A hop the boundary refused now names the Bot that was refused
+
+The audit page renders its Bot column from `payload.bot` and nothing else. `agent.handoff_offered`
+and `agent.handoff_delivered` were given that key; the four rows either side of them — a hop
+refused, a hop retried, and a hop that failed for good — were not, so they showed a dash where the
+Bot belongs. Those are the rows somebody actually opens the trail for: a hop that happened is visible
+in the transcript anyway, and a refused or lost one is visible nowhere else. All four now name the
+asking Bot, exactly as the accepted pair and `agent.escalated` already did.
 ### A failed tool refresh no longer leaves a connector offering nothing
 
 Refreshing a connector's tools replaced the list with a delete and then an insert, as two separate
