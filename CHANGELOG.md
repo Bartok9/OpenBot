@@ -8,6 +8,15 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
+### A policy dry-run no longer counts a failed action twice, or invents a change it did not make
+
+Testing a boundary against recent history replayed three kinds of audit row, and one of them is a
+duplicate: a permitted action that fails is recorded both as the decision that allowed it and as a
+separate failure row, so every failed action was scanned and scored twice. Worse, a dry-run policy
+carries a refused action out, so a refused action can fail too — and its two rows disagree, the
+decision row saying "refused" and the failure row reading as "allowed", so a candidate policy that
+refused it identically was reported as a new refusal it never introduced. The replay now scores each
+action once, from the row that recorded its decision.
 ### A message no longer routes to a specialist because a longer word contained a connector's name
 
 When the intent router falls back — it is unreachable, or it declines — and exactly one coworker can
