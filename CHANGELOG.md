@@ -14,6 +14,15 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 bound a random port while the published mapping still pointed at 4300. Empty now means the default
 4300; a non-numeric or out-of-range value refuses to start instead of binding port 30 from a typo
 like `30o0`.
+### An empty `PORT` no longer starts the server on a port nobody asked for
+
+`PORT` and `SERVER_PORT` name one number, and either is meant to move the server. A `PORT` that was
+declared but empty — a compose file passing a variable the host never set, or `PORT=` left in a
+`.env` next to a `SERVER_PORT` that was set — was read as "set to nothing": `SERVER_PORT` was
+ignored, the number parsed to `NaN`, and the server came up on an ephemeral port while everything
+that polls `SERVER_PORT` reported it had never started. An empty value now counts as unset, the way
+every other setting already treats it, and a value that is not a whole port number (`30o1` used to
+start the server on port 30) refuses to start instead.
 
 ### Coworkers are made in a wizard and managed in a dialog
 
