@@ -8,6 +8,16 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
+### Reopening a channel no longer hides the end of the last conversation
+
+Opening a channel joins the realtime gateway, and the snapshot the join returns can lag the durable
+store. When it did, the last exchange of a finished turn was missing from the transcript on every
+reload, with no unread marker or anything else to explain the gap, and the stored copy never got a
+chance to replace it because history was only restored into an empty channel.
+
+The stored thread now wins whenever it holds more than the channel does and holds everything the
+channel already shows. A message typed while history is still loading is not in the store yet, and
+a run still streaming has messages the store has not seen, so neither is rolled back.
 ### The transcript stays with the question when an answer starts arriving
 
 Sending a message carried it up to the top of the view, correctly, and then the Bot's first token
