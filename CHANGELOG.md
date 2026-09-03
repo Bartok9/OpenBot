@@ -8,6 +8,12 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
+### An empty supervisor PORT is unset, not an ephemeral bind
+
+`PORT=` left blank in compose or a `.env` used to reach `Bun.serve` as `NaN`, so the supervisor
+bound a random port while the published mapping still pointed at 4300. Empty now means the default
+4300; a non-numeric or out-of-range value refuses to start instead of binding port 30 from a typo
+like `30o0`.
 ### An empty `PORT` no longer starts the server on a port nobody asked for
 
 `PORT` and `SERVER_PORT` name one number, and either is meant to move the server. A `PORT` that was
