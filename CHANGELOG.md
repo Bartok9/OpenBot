@@ -8,6 +8,12 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
+### A bad `COMPUTER_MEMORY_BYTES` refuses to start the supervisor, instead of capping a computer at 512 bytes
+
+`COMPUTER_MEMORY_BYTES=512m` used to parse as `512` via `parseInt`, which Docker accepts as a memory
+cap Chromium cannot live in. Empty `COMPUTER_MEMORY_BYTES=` is still unset (no cap). A value that is
+not a whole number of bytes now exits before any computer is created.
+
 ### The engine socket the supervisor is given can be pointed somewhere else
 
 Compose mounted `/var/run/docker.sock` into the supervisor as a fixed path. That is correct for

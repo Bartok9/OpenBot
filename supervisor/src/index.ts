@@ -12,6 +12,7 @@ import {
 } from "./docker";
 import { registerEntry } from "./identity";
 import { namesFor } from "./names";
+import { computerMemoryBytes } from "./computer-memory-bytes";
 import { listenPort } from "./listen-port";
 
 /**
@@ -60,9 +61,12 @@ if (!token) {
 const image = process.env.COMPUTER_IMAGE ?? "openbot-agent-computer:latest";
 const network = process.env.COMPUTER_NETWORK;
 const runtime = process.env.COMPUTER_RUNTIME;
-const memoryBytes = process.env.COMPUTER_MEMORY_BYTES
-  ? Number.parseInt(process.env.COMPUTER_MEMORY_BYTES, 10)
-  : undefined;
+const resolvedMemory = computerMemoryBytes(process.env.COMPUTER_MEMORY_BYTES);
+if (!resolvedMemory.ok) {
+  console.error(resolvedMemory.reason);
+  process.exit(1);
+}
+const memoryBytes = resolvedMemory.bytes;
 const spireSocketVolume = process.env.SPIRE_AGENT_SOCKET_VOLUME;
 
 /**
