@@ -8,6 +8,15 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
+### The trail says who a coworker was opened to
+
+Making a coworker public admits every signed-in person to it, and being admitted to a coworker is
+being allowed to act as it — with the connectors, the tools and the browser it was granted. It is one
+click in the coworker dialog. The `bot.created` and `bot.updated` rows recorded the name, the
+endpoint and whether a key was set, and said nothing about this, so an edit that opened a coworker to
+the whole deployment was byte-identical on the audit page to one that corrected its title. Both rows
+now carry the visibility, on every edit rather than only the edit that moved it, so reading the trail
+forward says who could reach each coworker at any point.
 ### Duplicating a Bot in the box keeps its instructions
 
 A coworker that runs on this deployment's own Bot has no endpoint — it has a prompt, which is the
