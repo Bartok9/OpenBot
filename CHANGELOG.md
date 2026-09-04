@@ -8,6 +8,22 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
+### A person can set standing instructions that every coworker follows
+
+Settings now has a box for standing instructions: one piece of text per person, saved once and
+spliced into every built-in coworker's prompt, in every channel, on every run, including the runs a
+routine starts overnight. It is the place for what is true of every task rather than of any one of
+them, such as how somebody wants to be written to or what their company is and is not to be called.
+A coworker's role still decides what it does; these decide how it does it, and the prompt says so,
+so an instruction cannot quietly redefine what a coworker is for.
+
+Instructions belong to the person who wrote them. Nobody, administrators included, can read or set
+somebody else's, and they are deleted with the account. A coworker running at a remote AG-UI
+endpoint is not sent them, since this deployment does not compose that prompt. Nothing is added to
+any prompt until somebody writes something, so a deployment where nobody uses this behaves exactly
+as before.
+
+This adds migration `0026_user_instructions`, which creates one table.
 ### The trail says who a coworker was opened to
 
 Making a coworker public admits every signed-in person to it, and being admitted to a coworker is
