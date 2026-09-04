@@ -10,6 +10,7 @@ import { GalleryTools } from "./gallery-tools";
 import { GENERATIVE_UI_DESIGN_SKILL } from "./generative-ui";
 import { HandoffTool } from "./handoff-tool";
 import { SandboxedTools } from "./sandboxed-tools";
+import { SkillTools } from "./skill-tools";
 
 /**
  * The CopilotKit client, wrapped once for the whole authenticated app.
@@ -63,6 +64,8 @@ export function CopilotProvider({ children }: { children: ReactNode }) {
         <GalleryTools />
         {/* Browser-authored components use the same component grants as the compiled gallery. */}
         <SandboxedTools />
+        {/* Offered only on a Bot holding the skill-creator skill; see skill-tools.tsx. */}
+        <SkillTools />
         {/*
           Making a coworker from a conversation. Registers nothing unless the declared Bot holds the
           `bot-creator` skill, so most runs are not offered these four tools at all.
