@@ -8,6 +8,10 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
+### Example LangGraph and Mastra Bots no longer bind an ephemeral port on empty `PORT=`
+
+An empty `PORT=` in compose or `.env` used to become `NaN` for those two example processes, so they listened on a random port while docs still named 4300/4400. They now use the same `listenPort` helper as `agent-bot`: empty is the documented default, and a prefix typo refuses to start.
+
 ## 0.0.8
 
 ### A desktop shell that installs OpenBot and then becomes it
