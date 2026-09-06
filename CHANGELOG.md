@@ -8,6 +8,15 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
+### Pressing Stop is recorded as a stop, not as a computer that is not running
+
+The computer transport answered a Stop correctly only when it arrived before the request left. The
+caller's signal is handed to `fetch` precisely so a Stop can also land mid-action, and a fetch
+aborted that way rejects with an `AbortError`, which fell through to the message for a computer that
+cannot be reached. The person was told their own click had failed because the assistant's computer
+was not running, and the gateway wrote that sentence into the action's audit row as its failure --
+so a deliberate stop read back as an outage. A genuinely unreachable computer and a timeout still
+say what they said.
 ### A component the server refused is no longer drawn anyway
 
 A sandboxed component asks the server at call time whether the Bot may still use it, and a refusal
