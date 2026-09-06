@@ -8,6 +8,10 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
+### An empty Bot `PORT` is unset, so NaN never reaches Bun.serve
+
+`PORT=` on `agent-bot` and `agent-langgraph` used to parse as `NaN` (`??` does not treat empty as absent) and `Bun.serve` bound an ephemeral port while compose still published 4200/4201. A prefix typo (`42o0`) started on 42. Empty now means the shipped default; anything that is not a whole port number refuses to start.
+
 ### The server connects to Postgres on Windows, and `localhost` is no longer a coin toss
 
 Two separate faults, both of which stop a deployment reaching its own database and neither of which
