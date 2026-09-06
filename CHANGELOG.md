@@ -8,6 +8,15 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
+### A component whose name has a stray space is the same component
+
+The catalogue announcement asked whether each component's `name`, `title`, `kind` and `description`
+were more than whitespace, and then published the untrimmed strings. A `name` is a component's
+identity -- it is what `syncCatalogue` compares against what is already published, what `decide` and
+`listForAgent` look up, and what a grant names -- so a build shipping `" weatherPanel "` added a
+second catalogue row beside `weatherPanel`: published, ungranted by anybody, and impossible to hold
+a Bot back from under the name people use. The four fields are now stored as the strings the guard
+approved.
 ### A password with a `%` in it says so, instead of failing as `URI error`
 
 `DATABASE_URL` is taken apart before it reaches Bun, and each part is percent-decoded. A part
