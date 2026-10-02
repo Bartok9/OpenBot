@@ -580,6 +580,58 @@ describe("group conversations in PostgreSQL", () => {
       text: "From your notes: the launch slipped.",
     });
   });
+  test("a reply held for the owner's permission still hands off to the Bot it names", async () => {
+    const owner = await person();
+    const teammate = await person();
+    const ada = await bot(owner, "Ada");
+    const grace = await bot(owner, "Grace");
+    let decision: "pending" | "approved" = "pending";
+    const privateShare = createPrivateShareCheck({
+      approvals: {
+        open: async () =>
+          ({ id: `${prefix}-held-relay`, status: decision }) as never,
+        list: async () => [],
+        rules: async () => [],
+      },
+    });
+    const { conversations, audit } = service({
+      replies: {
+        [ada]: () => "Over to you, @Grace.",
+        [grace]: () => "On it.",
+      },
+      privateShare,
+    });
+    const channel = await conversations.create(owner.id, {
+      agentIds: [ada, grace],
+    });
+    const [row] = await database
+      .select({ email: users.email })
+      .from(users)
+      .where(eq(users.id, teammate.id));
+    await conversations.addMember(owner.id, channel.id, { email: row?.email });
+    await conversations.send(owner.id, channel.id, {
+      id: `${prefix}-held-relay-send`,
+      text: "ask grace",
+      agentId: ada,
+    });
+    await drain(conversations);
+    expect(
+      audit.filter((event) => event.eventType === "agent.handoff_offered"),
+    ).toHaveLength(0);
+
+    decision = "approved";
+    await conversations.continueWaiting(`${prefix}-held-relay`, async () => {
+      throw new Error("a held reply is shown, not re-run");
+    });
+    await drain(conversations);
+    expect(
+      audit.filter((event) => event.eventType === "agent.handoff_offered"),
+    ).toHaveLength(1);
+    const after = await conversations.list(owner.id, channel.id);
+    expect(after.messages.some((message) => message.text === "On it.")).toBe(
+      true,
+    );
+  });
   test("while a reply waits on the owner's permission, other members do not see it stream in", async () => {
     const owner = await person();
     const teammate = await person();

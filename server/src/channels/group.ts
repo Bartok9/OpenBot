@@ -1019,8 +1019,15 @@ export function createGroupConversations(deps: {
           messageId: row.id,
           agentIds: [agentId],
           text: held.text,
+          ...chainFrom(row.details),
         };
         await deps.activity?.(shown, agentId, held.text, `group:${row.id}`);
+        // The same reply allowed immediately would have been handed to the Bots it names.
+        // Holding it for the owner's permission must not drop that handoff.
+        const bots = await orderedRoster(row.ownerUserId, row.channelId);
+        const bot = bots?.find((candidate) => candidate.id === agentId);
+        if (bots && bot)
+          await relay(shown, bot, row.id, held.text, bots, runIdFor(row.id));
         return { replyText: held.text };
       }
       try {

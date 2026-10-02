@@ -8,6 +8,10 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
+### A group reply the owner allows still reaches the Bot it names
+
+A reply held until its owner allowed it to be shown in a group was written into the transcript and then stopped. The same reply allowed immediately was handed to the Bot it named. Allowing it now hands it on the same way.
+
 **Before upgrading.** Four things change for an existing deployment:
 - Automatic Learning is on unless an administrator saved it off. It does nothing until a Learning
   container is assigned; see below.
